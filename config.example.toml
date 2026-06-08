@@ -1,0 +1,49 @@
+# dnsix example configuration.
+#
+# Only `upstreams` is required; every other key shows its default.
+
+# IPv6-only listen address. Must be an IPv6 address (the listener is IPv6-only
+# by design). Default: all interfaces on port 53.
+listen = "[::]:53"
+
+# NAT64 prefix to embed IPv4 addresses into. Only /96 is supported.
+# Default: the RFC 6052 well-known prefix.
+nat64_prefix = "64:ff9b::"
+
+# Optional cap on synthesized-record TTLs (seconds). Omit to inherit the A TTL.
+# ttl_cap = 600
+
+# In-memory response cache size, in entries (each cached name+type is one entry).
+# Set to 0 to disable. The cache is positive-only and is bypassed for DNSSEC-aware
+# (DO-bit) queries, which always get a full-fidelity upstream answer. Default: 4096.
+cache_size = 4096
+
+# Prometheus metrics endpoint (GET /metrics) for Zabbix or any Prometheus scraper.
+# Omit to disable the endpoint. On an IPv6-only host use an IPv6 address. The
+# endpoint is unauthenticated, so bind loopback ("[::1]:9153") or keep it behind a
+# trusted network.
+# metrics_listen = "[::]:9153"
+
+# Upstream resolvers, tried in order with failover. The listener is IPv6-only,
+# but upstreams may be IPv4 or IPv6 — use whatever the host can reach. On an
+# IPv6-only host (the usual DNS64 deployment) these must be IPv6.
+upstreams = ["[2606:4700:4700::1111]:53", "[2001:4860:4860::8888]:53"]
+
+# Enabled Synthesizers, in chain order (first to produce records wins). Config
+# order IS precedence: a specific Provider must precede the generic one it would
+# be shadowed by (e.g. "shopify"/"webflow" before "cloudflare"), and "nat64" —
+# the prefix-embedding fallback — belongs last. Startup rejects orders that
+# violate these constraints. Omit this key for the original DNS64-only behaviour
+# (equivalent to synthesizers = ["nat64"]).
+#
+# CDN Providers point at real native CDN IPv6 (no NAT64 translator hop)
+#
+# synthesizers = [
+#   "shopify", "webflow", "cloudflare",
+#   "fastly", "akamai", "cloudfront", "s3", "oss", "alicdn",
+#   "oracleobjectstorage", "msedge", "edgecast", "limelight",
+#   "bunnycdn", "blazingcdn", "gcorecdn", "cachefly", "cdn77",
+#   "awsglb", "weebly", "sucuri", "netlify", "bearblog",
+#   "azurewebsites", "wpvip",
+#   "nat64",
+# ]
