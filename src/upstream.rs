@@ -110,17 +110,18 @@ impl Pool {
         // DnsLru clamps record TTLs to TtlConfig's bounds; the defaults (min 0,
         // max 1 day) are the right behaviour for a forwarder cache.
         let cache = (cache_size > 0).then(|| DnsLru::new(cache_size, TtlConfig::default()));
-        Ok(Self { upstreams, cache, metrics })
+        Ok(Self {
+            upstreams,
+            cache,
+            metrics,
+        })
     }
 
     /// Resolve a query, serving from cache when possible and otherwise querying
     /// upstream. Returns `None` only if every upstream failed.
     pub async fn resolve(&self, query: Message) -> Option<DnsResponse> {
         // Only cacheable queries get a key; everything else bypasses the cache.
-        let key = self
-            .cache
-            .as_ref()
-            .and_then(|_| cacheable_question(&query));
+        let key = self.cache.as_ref().and_then(|_| cacheable_question(&query));
 
         if let (Some(cache), Some(question)) = (&self.cache, &key) {
             if let Some(resp) = cache_get(cache, question) {
@@ -285,7 +286,11 @@ mod tests {
         let cache = lru();
         let q = a_query("example.com.");
         let now = Instant::now();
-        cache.insert_records(q.clone(), [a_record("example.com.", [93, 1, 2, 3], 300)].into_iter(), now);
+        cache.insert_records(
+            q.clone(),
+            [a_record("example.com.", [93, 1, 2, 3], 300)].into_iter(),
+            now,
+        );
 
         let records = cached_records(&cache, &q, now).expect("cache hit");
         assert_eq!(records.len(), 1);
@@ -336,7 +341,11 @@ mod tests {
         let cache = lru();
         let q = a_query("example.com.");
         let now = Instant::now();
-        cache.insert_records(q.clone(), [a_record("example.com.", [93, 1, 2, 3], 5)].into_iter(), now);
+        cache.insert_records(
+            q.clone(),
+            [a_record("example.com.", [93, 1, 2, 3], 5)].into_iter(),
+            now,
+        );
 
         let later = now + Duration::from_secs(10);
         assert!(cached_records(&cache, &q, later).is_none());
@@ -348,15 +357,24 @@ mod tests {
         let cache = lru();
         let q = a_query("example.com.");
         let now = Instant::now();
-        cache.insert_records(q.clone(), [a_record("example.com.", [93, 1, 2, 3], 300)].into_iter(), now);
+        cache.insert_records(
+            q.clone(),
+            [a_record("example.com.", [93, 1, 2, 3], 300)].into_iter(),
+            now,
+        );
 
         let records = cached_records(&cache, &q, now + Duration::from_secs(100)).expect("hit");
-        assert!(records[0].ttl() <= 200, "ttl should have decayed, got {}", records[0].ttl());
+        assert!(
+            records[0].ttl() <= 200,
+            "ttl should have decayed, got {}",
+            records[0].ttl()
+        );
     }
 
     fn message_with(queries: &[Query], dnssec_ok: bool) -> Message {
         let mut msg = Message::new();
-        msg.set_message_type(MessageType::Query).set_op_code(OpCode::Query);
+        msg.set_message_type(MessageType::Query)
+            .set_op_code(OpCode::Query);
         for q in queries {
             msg.add_query(q.clone());
         }

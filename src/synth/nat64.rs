@@ -33,7 +33,8 @@ pub fn is_globally_routable(ip: Ipv4Addr) -> bool {
         || ip.is_documentation()                    // 192.0.2/24, 198.51.100/24, 203.0.113/24
         || (o[0] == 198 && (o[1] & 0xfe) == 18)     // 198.18/15   benchmarking
         || ip.is_multicast()                        // 224/4
-        || o[0] >= 240                              // 240/4 reserved + 255.255.255.255 broadcast
+        || o[0] >= 240
+        // 240/4 reserved + 255.255.255.255 broadcast
     )
 }
 
@@ -179,7 +180,10 @@ mod tests {
     #[test]
     fn detect_embeds_eligible_only() {
         let nat = Nat64::new(WK);
-        let c = ctx("dual.example.com.", &[Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(93, 184, 216, 34)]);
+        let c = ctx(
+            "dual.example.com.",
+            &[Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(93, 184, 216, 34)],
+        );
         let plan = nat.detect(&c).expect("nat64 always plans when A present");
         let out = (plan.combine)(&[], &c.a_addrs());
         assert_eq!(out, vec!["64:ff9b::5db8:d822".parse::<Ipv6Addr>().unwrap()]);

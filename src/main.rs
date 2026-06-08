@@ -54,7 +54,11 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("reading config file {}", args.config.display()))?;
     let cfg = Config::from_toml(&text).context("parsing configuration")?;
 
-    let chain = Arc::new(Chain::build(&cfg.synthesizers, cfg.nat64_prefix, cfg.ttl_cap)?);
+    let chain = Arc::new(Chain::build(
+        &cfg.synthesizers,
+        cfg.nat64_prefix,
+        cfg.ttl_cap,
+    )?);
     let metrics = Arc::new(Metrics::new(&cfg.synthesizers));
 
     // Start the Prometheus metrics endpoint if configured (best-effort; bind

@@ -5,8 +5,8 @@
 //! Detection uses three signals (hostname/CNAME-target suffix, A-record IP range,
 //! DNS authority) and four derivation methods (constant, borrow a reference
 //! domain's live IPv6, rewrite into a dual-stack hostname and resolve it, or an
-//! algorithmic transform of the A address). Per the freshness guard, borrow/resolve 
-//! lookups are live (cached) and a hardcoded constant — where a CDN has one — is 
+//! algorithmic transform of the A address). Per the freshness guard, borrow/resolve
+//! lookups are live (cached) and a hardcoded constant — where a CDN has one — is
 //! only a last-resort fallback, expressed in the `combine` closure.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -26,11 +26,11 @@ pub(super) fn make(id: &str) -> Option<Box<dyn Synthesizer>> {
             ranges: &[
                 "104.16.0.0/12",
                 "162.159.128.0/17",
-                "216.198.53.0/24", // zendesk
-                "216.198.54.0/24", // zendesk
+                "216.198.53.0/24",  // zendesk
+                "216.198.54.0/24",  // zendesk
                 "141.193.213.0/24", // wpengine
-                "94.247.142.0/24", // servd
-                "103.133.1.0/24",  // laravel cloud
+                "94.247.142.0/24",  // servd
+                "103.133.1.0/24",   // laravel cloud
             ],
             addr: "2606:4700::6810:bad",
             reference: Some("www.cloudflare.com"),
@@ -38,7 +38,12 @@ pub(super) fn make(id: &str) -> Option<Box<dyn Synthesizer>> {
         "shopify" => Box::new(MatchConst {
             id: "shopify",
             suffixes: &[&["shopify", "com"], &["myshopify", "com"]],
-            ranges: &["23.227.37.0/24", "23.227.38.0/23", "23.227.60.0/24", "185.146.172.0/23"],
+            ranges: &[
+                "23.227.37.0/24",
+                "23.227.38.0/23",
+                "23.227.60.0/24",
+                "185.146.172.0/23",
+            ],
             addr: "2620:127:f00f::",
             reference: None,
         }),
@@ -132,18 +137,38 @@ pub(super) fn make(id: &str) -> Option<Box<dyn Synthesizer>> {
         }),
 
         // --- rewrite hostname into a dual-stack variant, then resolve ---
-        "akamai" => Box::new(MatchRewrite { id: "akamai", rewrite: akamai_rewrite }),
-        "s3" => Box::new(MatchRewrite { id: "s3", rewrite: s3_rewrite }),
-        "oss" => Box::new(MatchRewrite { id: "oss", rewrite: oss_rewrite }),
-        "oracleobjectstorage" => {
-            Box::new(MatchRewrite { id: "oracleobjectstorage", rewrite: oracle_rewrite })
-        }
-        "awsglb" => Box::new(MatchRewrite { id: "awsglb", rewrite: awsglb_rewrite }),
-        "edgecast" => Box::new(MatchRewrite { id: "edgecast", rewrite: edgecast_rewrite }),
-        "limelight" => Box::new(MatchRewrite { id: "limelight", rewrite: limelight_rewrite }),
-        "azurewebsites" => {
-            Box::new(MatchRewrite { id: "azurewebsites", rewrite: azure_rewrite })
-        }
+        "akamai" => Box::new(MatchRewrite {
+            id: "akamai",
+            rewrite: akamai_rewrite,
+        }),
+        "s3" => Box::new(MatchRewrite {
+            id: "s3",
+            rewrite: s3_rewrite,
+        }),
+        "oss" => Box::new(MatchRewrite {
+            id: "oss",
+            rewrite: oss_rewrite,
+        }),
+        "oracleobjectstorage" => Box::new(MatchRewrite {
+            id: "oracleobjectstorage",
+            rewrite: oracle_rewrite,
+        }),
+        "awsglb" => Box::new(MatchRewrite {
+            id: "awsglb",
+            rewrite: awsglb_rewrite,
+        }),
+        "edgecast" => Box::new(MatchRewrite {
+            id: "edgecast",
+            rewrite: edgecast_rewrite,
+        }),
+        "limelight" => Box::new(MatchRewrite {
+            id: "limelight",
+            rewrite: limelight_rewrite,
+        }),
+        "azurewebsites" => Box::new(MatchRewrite {
+            id: "azurewebsites",
+            rewrite: azure_rewrite,
+        }),
 
         // --- custom ---
         "fastly" => Box::new(Fastly),
@@ -219,7 +244,10 @@ impl Synthesizer for MatchConst {
         }
         let addr: Ipv6Addr = self.addr.parse().expect("valid constant address");
         Some(match self.reference {
-            Some(r) => Plan { resolve: vec![fqdn(r)], combine: borrow_or(Some(addr)) },
+            Some(r) => Plan {
+                resolve: vec![fqdn(r)],
+                combine: borrow_or(Some(addr)),
+            },
             None => Plan::pure(Box::new(move |_, _| vec![addr])),
         })
     }
@@ -245,8 +273,13 @@ impl Synthesizer for MatchBorrow {
         if !(soa || host_matches(ctx, self.suffixes) || ip_matches(ctx, self.ranges)) {
             return None;
         }
-        let fallback = self.fallback.map(|f| f.parse().expect("valid fallback address"));
-        Some(Plan { resolve: vec![fqdn(self.reference)], combine: borrow_or(fallback) })
+        let fallback = self
+            .fallback
+            .map(|f| f.parse().expect("valid fallback address"));
+        Some(Plan {
+            resolve: vec![fqdn(self.reference)],
+            combine: borrow_or(fallback),
+        })
     }
 }
 
@@ -264,7 +297,10 @@ impl Synthesizer for MatchRewrite {
     fn detect(&self, ctx: &SynthContext) -> Option<Plan> {
         for h in ctx.hostnames() {
             if let Some(target) = (self.rewrite)(h) {
-                return Some(Plan { resolve: vec![target], combine: verbatim() });
+                return Some(Plan {
+                    resolve: vec![target],
+                    combine: verbatim(),
+                });
             }
         }
         None
@@ -284,7 +320,11 @@ fn akamai_rewrite(name: &Name) -> Option<Name> {
         return None;
     }
     let lab = &l[n - 3];
-    l[n - 3] = if lab == "cj" { format!("ds{lab}") } else { format!("dsc{lab}") };
+    l[n - 3] = if lab == "cj" {
+        format!("ds{lab}")
+    } else {
+        format!("dsc{lab}")
+    };
     name_from_labels(&l)
 }
 
@@ -347,7 +387,11 @@ fn cachefly_rewrite(name: &Name) -> Option<Name> {
     if !is_vip_label(first) {
         return None;
     }
-    let first = if first.starts_with("vip") { format!("r{first}") } else { first.clone() };
+    let first = if first.starts_with("vip") {
+        format!("r{first}")
+    } else {
+        first.clone()
+    };
     let mut middle = l[1..n - 2].join(".");
     if middle.is_empty() {
         return None;
@@ -370,7 +414,12 @@ fn is_vip_label(s: &str) -> bool {
 fn s3_rewrite(name: &Name) -> Option<Name> {
     let mut s = labels(name);
     s.reverse();
-    let idx = |v: &[String], t: &str| v.iter().position(|x| x == t).map(|p| p as isize).unwrap_or(-1);
+    let idx = |v: &[String], t: &str| {
+        v.iter()
+            .position(|x| x == t)
+            .map(|p| p as isize)
+            .unwrap_or(-1)
+    };
 
     let mut dp1 = idx(&s, "cn");
     if dp1 == 0 {
@@ -408,10 +457,7 @@ fn s3_rewrite(name: &Name) -> Option<Name> {
         dp1 = -1;
     } else if dp9 == 2 {
         return None;
-    } else if ssdomains[0] == "s3"
-        && (ssdomains.len() == 3 || ssdomains.len() == 2)
-        && dp1 != 0
-    {
+    } else if ssdomains[0] == "s3" && (ssdomains.len() == 3 || ssdomains.len() == 2) && dp1 != 0 {
         splice_insert(&mut s, 2, "us-east-1");
         if ssdomains.get(1).map(String::as_str) == Some("1") {
             s[3] = "s3-r-w".to_string();
@@ -455,7 +501,12 @@ fn s3_rewrite(name: &Name) -> Option<Name> {
 fn oss_rewrite(name: &Name) -> Option<Name> {
     let mut s = labels(name);
     s.reverse();
-    let idx = |v: &[String], t: &str| v.iter().position(|x| x == t).map(|p| p as isize).unwrap_or(-1);
+    let idx = |v: &[String], t: &str| {
+        v.iter()
+            .position(|x| x == t)
+            .map(|p| p as isize)
+            .unwrap_or(-1)
+    };
 
     let dp0 = idx(&s, "com");
     let dp1 = idx(&s, "aliyuncs");
@@ -474,7 +525,11 @@ fn oss_rewrite(name: &Name) -> Option<Name> {
         ssdomains = s[3].split('-').map(String::from).collect();
         ssdoaminloc = 3;
     }
-    let dpff3 = ssdomains.iter().position(|x| x == "oss").map(|p| p as isize).unwrap_or(-1);
+    let dpff3 = ssdomains
+        .iter()
+        .position(|x| x == "oss")
+        .map(|p| p as isize)
+        .unwrap_or(-1);
 
     if s.len() == 4 && dpff1 < 0 {
         splice_remove(&mut s, 3);
@@ -536,7 +591,11 @@ fn oracle_rewrite(name: &Name) -> Option<Name> {
         service = body[0];
         region = body[1];
     } else if body.len() == 3 && body[0] == "compat" && body[1] == "objectstorage" {
-        return parse_name(&format!("objectstorage.{}.ds.oci.customer-oci.com", body[2])).ok();
+        return parse_name(&format!(
+            "objectstorage.{}.ds.oci.customer-oci.com",
+            body[2]
+        ))
+        .ok();
     } else if body.len() == 3 && (body[1] == "objectstorage" || body[1] == "swiftobjectstorage") {
         namespace = Some(body[0]);
         service = body[1];
@@ -638,17 +697,27 @@ impl Synthesizer for Fastly {
     fn detect(&self, ctx: &SynthContext) -> Option<Plan> {
         let v4 = ctx.a_addrs();
         let fastly_ip = v4.iter().any(|ip| in_any(*ip, FASTLY_RANGES));
-        let github_ip = v4.iter().find(|ip| in_cidr(**ip, GITHUB_PAGES_RANGE)).copied();
+        let github_ip = v4
+            .iter()
+            .find(|ip| in_cidr(**ip, GITHUB_PAGES_RANGE))
+            .copied();
 
         // IP / authority path: borrow a reference prefix and fuse the host id.
         if soa_admin_is(ctx, "hostmaster.fastly.com") || fastly_ip {
-            let chosen = v4.iter().find(|ip| in_any(**ip, FASTLY_RANGES)).copied().or_else(|| v4.first().copied());
+            let chosen = v4
+                .iter()
+                .find(|ip| in_any(**ip, FASTLY_RANGES))
+                .copied()
+                .or_else(|| v4.first().copied());
             if let Some(ip) = chosen {
                 let hostid = fastly_v6hex(ip, false);
                 return Some(Plan {
                     resolve: vec![fqdn(FASTLY_REF)],
                     combine: Box::new(move |resolved, _| {
-                        resolved.iter().filter_map(|p| fastly_fuse(*p, hostid)).collect()
+                        resolved
+                            .iter()
+                            .filter_map(|p| fastly_fuse(*p, hostid))
+                            .collect()
                     }),
                 });
             }
@@ -658,7 +727,10 @@ impl Synthesizer for Fastly {
             return Some(Plan {
                 resolve: vec![fqdn(GITHUB_PAGES_REF)],
                 combine: Box::new(move |resolved, _| {
-                    resolved.iter().filter_map(|p| fastly_fuse(*p, hostid)).collect()
+                    resolved
+                        .iter()
+                        .filter_map(|p| fastly_fuse(*p, hostid))
+                        .collect()
                 }),
             });
         }
@@ -669,7 +741,10 @@ impl Synthesizer for Fastly {
                 let mut l = labels(h);
                 l.insert(0, "dualstack".to_string());
                 if let Some(target) = name_from_labels(&l) {
-                    return Some(Plan { resolve: vec![target], combine: verbatim() });
+                    return Some(Plan {
+                        resolve: vec![target],
+                        combine: verbatim(),
+                    });
                 }
             }
         }
@@ -734,7 +809,11 @@ impl Synthesizer for Wpvip {
         "wpvip"
     }
     fn detect(&self, ctx: &SynthContext) -> Option<Plan> {
-        if !ctx.a_records.iter().any(|(ip, _)| in_cidr(*ip, WPVIP_RANGE)) {
+        if !ctx
+            .a_records
+            .iter()
+            .any(|(ip, _)| in_cidr(*ip, WPVIP_RANGE))
+        {
             return None;
         }
         Some(Plan::pure(Box::new(|_, v4| {
@@ -742,9 +821,12 @@ impl Synthesizer for Wpvip {
                 .filter(|ip| in_cidr(**ip, WPVIP_RANGE))
                 .filter_map(|ip| {
                     let o = ip.octets();
-                    format!("2a04:fa87:fffd::{:02x}{:02x}:{:02x}{:02x}", o[0], o[1], o[2], o[3])
-                        .parse()
-                        .ok()
+                    format!(
+                        "2a04:fa87:fffd::{:02x}{:02x}:{:02x}{:02x}",
+                        o[0], o[1], o[2], o[3]
+                    )
+                    .parse()
+                    .ok()
                 })
                 .collect()
         })))
@@ -769,10 +851,17 @@ impl Synthesizer for Cachefly {
     fn detect(&self, ctx: &SynthContext) -> Option<Plan> {
         for h in ctx.hostnames() {
             if let Some(target) = cachefly_rewrite(h) {
-                return Some(Plan { resolve: vec![target], combine: verbatim() });
+                return Some(Plan {
+                    resolve: vec![target],
+                    combine: verbatim(),
+                });
             }
         }
-        if ctx.a_records.iter().any(|(ip, _)| in_cidr(*ip, CACHEFLY_RANGE)) {
+        if ctx
+            .a_records
+            .iter()
+            .any(|(ip, _)| in_cidr(*ip, CACHEFLY_RANGE))
+        {
             return Some(Plan::pure(Box::new(|_, v4| {
                 v4.iter()
                     .filter(|ip| in_cidr(**ip, CACHEFLY_RANGE))
@@ -789,50 +878,195 @@ impl Synthesizer for Cachefly {
 // ---------------------------------------------------------------------------
 
 const OSS_REGIONS: &[&str] = &[
-    "cn-hangzhou", "cn-shanghai", "cn-nanjing", "cn-qingdao", "cn-beijing", "cn-zhangjiakou",
-    "cn-huhehaote", "cn-wulanchabu", "cn-shenzhen", "cn-heyuan", "cn-guangzhou", "cn-chengdu",
-    "cn-hongkong", "us-west-1", "us-east-1", "ap-southeast-1", "ap-southeast-2", "ap-southeast-3",
-    "ap-southeast-4", "ap-southeast-5", "ap-southeast-6", "ap-southeast-7", "ap-northeast-1",
-    "ap-northeast-2", "ap-south-1", "eu-central-1", "eu-west-1", "me-east-1", "me-central-1",
-    "cn-hangzhou-finance", "cn-shanghai-finance", "cn-shenzhen-finance", "cn-beijing-finance-1",
+    "cn-hangzhou",
+    "cn-shanghai",
+    "cn-nanjing",
+    "cn-qingdao",
+    "cn-beijing",
+    "cn-zhangjiakou",
+    "cn-huhehaote",
+    "cn-wulanchabu",
+    "cn-shenzhen",
+    "cn-heyuan",
+    "cn-guangzhou",
+    "cn-chengdu",
+    "cn-hongkong",
+    "us-west-1",
+    "us-east-1",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ap-southeast-3",
+    "ap-southeast-4",
+    "ap-southeast-5",
+    "ap-southeast-6",
+    "ap-southeast-7",
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-south-1",
+    "eu-central-1",
+    "eu-west-1",
+    "me-east-1",
+    "me-central-1",
+    "cn-hangzhou-finance",
+    "cn-shanghai-finance",
+    "cn-shenzhen-finance",
+    "cn-beijing-finance-1",
     "cn-beijing-finance-2",
 ];
 
 /// CloudFront global + regional edge IPv4 ranges (from list-cloudfront-ips).
 const CLOUDFRONT_RANGES: &[&str] = &[
-    "120.52.22.96/27", "205.251.249.0/24", "180.163.57.128/26", "204.246.168.0/22",
-    "111.13.171.128/26", "18.160.0.0/15", "205.251.252.0/23", "54.192.0.0/16", "204.246.173.0/24",
-    "54.230.200.0/21", "120.253.240.192/26", "116.129.226.128/26", "130.176.0.0/17",
-    "108.156.0.0/14", "99.86.0.0/16", "13.32.0.0/15", "120.253.245.128/26", "13.224.0.0/14",
-    "70.132.0.0/18", "15.158.0.0/16", "111.13.171.192/26", "13.249.0.0/16", "18.238.0.0/15",
-    "18.244.0.0/15", "205.251.208.0/20", "65.9.128.0/18", "130.176.128.0/18", "58.254.138.0/25",
-    "205.251.201.0/24", "205.251.206.0/23", "54.230.208.0/20", "3.160.0.0/14", "116.129.226.0/25",
-    "52.222.128.0/17", "18.164.0.0/15", "111.13.185.32/27", "64.252.128.0/18", "205.251.254.0/24",
-    "54.230.224.0/19", "71.152.0.0/17", "216.137.32.0/19", "204.246.172.0/24", "205.251.202.0/23",
-    "18.172.0.0/15", "120.52.39.128/27", "118.193.97.64/26", "3.164.64.0/18", "18.154.0.0/15",
-    "54.240.128.0/18", "205.251.250.0/23", "180.163.57.0/25", "52.46.0.0/18", "52.82.128.0/19",
-    "54.230.0.0/17", "54.230.128.0/18", "54.239.128.0/18", "130.176.224.0/20", "36.103.232.128/26",
-    "52.84.0.0/15", "143.204.0.0/16", "144.220.0.0/16", "120.52.153.192/26", "119.147.182.0/25",
-    "120.232.236.0/25", "111.13.185.64/27", "3.164.0.0/18", "54.182.0.0/16", "58.254.138.128/26",
-    "120.253.245.192/27", "54.239.192.0/19", "18.68.0.0/16", "18.64.0.0/14", "120.52.12.64/26",
-    "99.84.0.0/16", "205.251.204.0/23", "130.176.192.0/19", "52.124.128.0/17", "205.251.200.0/24",
-    "204.246.164.0/22", "13.35.0.0/16", "204.246.174.0/23", "3.164.128.0/17", "3.172.0.0/18",
-    "36.103.232.0/25", "119.147.182.128/26", "118.193.97.128/25", "120.232.236.128/26",
-    "204.246.176.0/20", "65.8.0.0/16", "65.9.0.0/17", "108.138.0.0/15", "120.253.241.160/27",
+    "120.52.22.96/27",
+    "205.251.249.0/24",
+    "180.163.57.128/26",
+    "204.246.168.0/22",
+    "111.13.171.128/26",
+    "18.160.0.0/15",
+    "205.251.252.0/23",
+    "54.192.0.0/16",
+    "204.246.173.0/24",
+    "54.230.200.0/21",
+    "120.253.240.192/26",
+    "116.129.226.128/26",
+    "130.176.0.0/17",
+    "108.156.0.0/14",
+    "99.86.0.0/16",
+    "13.32.0.0/15",
+    "120.253.245.128/26",
+    "13.224.0.0/14",
+    "70.132.0.0/18",
+    "15.158.0.0/16",
+    "111.13.171.192/26",
+    "13.249.0.0/16",
+    "18.238.0.0/15",
+    "18.244.0.0/15",
+    "205.251.208.0/20",
+    "65.9.128.0/18",
+    "130.176.128.0/18",
+    "58.254.138.0/25",
+    "205.251.201.0/24",
+    "205.251.206.0/23",
+    "54.230.208.0/20",
+    "3.160.0.0/14",
+    "116.129.226.0/25",
+    "52.222.128.0/17",
+    "18.164.0.0/15",
+    "111.13.185.32/27",
+    "64.252.128.0/18",
+    "205.251.254.0/24",
+    "54.230.224.0/19",
+    "71.152.0.0/17",
+    "216.137.32.0/19",
+    "204.246.172.0/24",
+    "205.251.202.0/23",
+    "18.172.0.0/15",
+    "120.52.39.128/27",
+    "118.193.97.64/26",
+    "3.164.64.0/18",
+    "18.154.0.0/15",
+    "54.240.128.0/18",
+    "205.251.250.0/23",
+    "180.163.57.0/25",
+    "52.46.0.0/18",
+    "52.82.128.0/19",
+    "54.230.0.0/17",
+    "54.230.128.0/18",
+    "54.239.128.0/18",
+    "130.176.224.0/20",
+    "36.103.232.128/26",
+    "52.84.0.0/15",
+    "143.204.0.0/16",
+    "144.220.0.0/16",
+    "120.52.153.192/26",
+    "119.147.182.0/25",
+    "120.232.236.0/25",
+    "111.13.185.64/27",
+    "3.164.0.0/18",
+    "54.182.0.0/16",
+    "58.254.138.128/26",
+    "120.253.245.192/27",
+    "54.239.192.0/19",
+    "18.68.0.0/16",
+    "18.64.0.0/14",
+    "120.52.12.64/26",
+    "99.84.0.0/16",
+    "205.251.204.0/23",
+    "130.176.192.0/19",
+    "52.124.128.0/17",
+    "205.251.200.0/24",
+    "204.246.164.0/22",
+    "13.35.0.0/16",
+    "204.246.174.0/23",
+    "3.164.128.0/17",
+    "3.172.0.0/18",
+    "36.103.232.0/25",
+    "119.147.182.128/26",
+    "118.193.97.128/25",
+    "120.232.236.128/26",
+    "204.246.176.0/20",
+    "65.8.0.0/16",
+    "65.9.0.0/17",
+    "108.138.0.0/15",
+    "120.253.241.160/27",
     "64.252.64.0/18",
     // regional edge
-    "13.113.196.64/26", "13.113.203.0/24", "52.199.127.192/26", "13.124.199.0/24",
-    "3.35.130.128/25", "52.78.247.128/26", "13.233.177.192/26", "15.207.13.128/25",
-    "15.207.213.128/25", "52.66.194.128/26", "13.228.69.0/24", "52.220.191.0/26", "13.210.67.128/26",
-    "13.54.63.128/26", "43.218.56.128/26", "43.218.56.192/26", "43.218.56.64/26", "43.218.71.0/26",
-    "99.79.169.0/24", "18.192.142.0/23", "35.158.136.0/24", "52.57.254.0/24", "13.48.32.0/24",
-    "18.200.212.0/23", "52.212.248.0/26", "3.10.17.128/25", "3.11.53.0/24", "52.56.127.0/25",
-    "15.188.184.0/24", "52.47.139.0/24", "3.29.40.128/26", "3.29.40.192/26", "3.29.40.64/26",
-    "3.29.57.0/26", "18.229.220.192/26", "54.233.255.128/26", "3.231.2.0/25", "3.234.232.224/27",
-    "3.236.169.192/26", "3.236.48.0/23", "34.195.252.0/24", "34.226.14.0/24", "13.59.250.0/26",
-    "18.216.170.128/25", "3.128.93.0/24", "3.134.215.0/24", "52.15.127.128/26", "3.101.158.0/23",
-    "52.52.191.128/26", "34.216.51.0/25", "34.223.12.224/27", "34.223.80.192/26", "35.162.63.192/26",
-    "35.167.191.128/26", "44.227.178.0/24", "44.234.108.128/25", "44.234.90.252/30",
+    "13.113.196.64/26",
+    "13.113.203.0/24",
+    "52.199.127.192/26",
+    "13.124.199.0/24",
+    "3.35.130.128/25",
+    "52.78.247.128/26",
+    "13.233.177.192/26",
+    "15.207.13.128/25",
+    "15.207.213.128/25",
+    "52.66.194.128/26",
+    "13.228.69.0/24",
+    "52.220.191.0/26",
+    "13.210.67.128/26",
+    "13.54.63.128/26",
+    "43.218.56.128/26",
+    "43.218.56.192/26",
+    "43.218.56.64/26",
+    "43.218.71.0/26",
+    "99.79.169.0/24",
+    "18.192.142.0/23",
+    "35.158.136.0/24",
+    "52.57.254.0/24",
+    "13.48.32.0/24",
+    "18.200.212.0/23",
+    "52.212.248.0/26",
+    "3.10.17.128/25",
+    "3.11.53.0/24",
+    "52.56.127.0/25",
+    "15.188.184.0/24",
+    "52.47.139.0/24",
+    "3.29.40.128/26",
+    "3.29.40.192/26",
+    "3.29.40.64/26",
+    "3.29.57.0/26",
+    "18.229.220.192/26",
+    "54.233.255.128/26",
+    "3.231.2.0/25",
+    "3.234.232.224/27",
+    "3.236.169.192/26",
+    "3.236.48.0/23",
+    "34.195.252.0/24",
+    "34.226.14.0/24",
+    "13.59.250.0/26",
+    "18.216.170.128/25",
+    "3.128.93.0/24",
+    "3.134.215.0/24",
+    "52.15.127.128/26",
+    "3.101.158.0/23",
+    "52.52.191.128/26",
+    "34.216.51.0/25",
+    "34.223.12.224/27",
+    "34.223.80.192/26",
+    "35.162.63.192/26",
+    "35.167.191.128/26",
+    "44.227.178.0/24",
+    "44.234.108.128/25",
+    "44.234.90.252/30",
 ];
 
 #[cfg(test)]
@@ -841,67 +1075,161 @@ mod tests {
     use std::str::FromStr;
 
     fn rw(f: fn(&Name) -> Option<Name>, s: &str) -> Option<String> {
-        f(&Name::from_str(&format!("{s}.")).unwrap()).map(|n| n.to_ascii().trim_end_matches('.').to_string())
+        f(&Name::from_str(&format!("{s}.")).unwrap())
+            .map(|n| n.to_ascii().trim_end_matches('.').to_string())
     }
 
     #[test]
     fn akamai() {
-        assert_eq!(rw(akamai_rewrite, "e123.akamaiedge.net").unwrap(), "dsce123.akamaiedge.net");
-        assert_eq!(rw(akamai_rewrite, "cj.akamai.net").unwrap(), "dscj.akamai.net");
+        assert_eq!(
+            rw(akamai_rewrite, "e123.akamaiedge.net").unwrap(),
+            "dsce123.akamaiedge.net"
+        );
+        assert_eq!(
+            rw(akamai_rewrite, "cj.akamai.net").unwrap(),
+            "dscj.akamai.net"
+        );
         assert!(rw(akamai_rewrite, "www.example.com").is_none());
     }
 
     #[test]
     fn awsglb() {
-        assert_eq!(rw(awsglb_rewrite, "abc.awsglobalaccelerator.com").unwrap(), "abc.dualstack.awsglobalaccelerator.com");
+        assert_eq!(
+            rw(awsglb_rewrite, "abc.awsglobalaccelerator.com").unwrap(),
+            "abc.dualstack.awsglobalaccelerator.com"
+        );
     }
 
     #[test]
     fn edgecast_limelight_azure() {
-        assert_eq!(rw(edgecast_rewrite, "foo.bar.v0cdn.net").unwrap(), "cs21.bar.v0cdn.net");
-        assert_eq!(rw(limelight_rewrite, "a.b.llnwi.net").unwrap(), "msftstore.b.llnwi.net");
-        assert_eq!(rw(azure_rewrite, "site.azurewebsites.windows.net").unwrap(), "sip-v4andv6.azurewebsites.windows.net");
+        assert_eq!(
+            rw(edgecast_rewrite, "foo.bar.v0cdn.net").unwrap(),
+            "cs21.bar.v0cdn.net"
+        );
+        assert_eq!(
+            rw(limelight_rewrite, "a.b.llnwi.net").unwrap(),
+            "msftstore.b.llnwi.net"
+        );
+        assert_eq!(
+            rw(azure_rewrite, "site.azurewebsites.windows.net").unwrap(),
+            "sip-v4andv6.azurewebsites.windows.net"
+        );
     }
 
     #[test]
     fn cachefly_hostname() {
-        assert_eq!(rw(cachefly_rewrite, "rvip1.g.cachefly.net").unwrap(), "rvip1-dstack.g.cachefly.net");
-        assert_eq!(rw(cachefly_rewrite, "vip1.g-anycast1.cachefly.net").unwrap(), "rvip1-dstack.g.cachefly.net");
-        assert_eq!(rw(cachefly_rewrite, "rvip33.g.cachefly.net").unwrap(), "rvip33-dstack.g.cachefly.net");
-        assert_eq!(rw(cachefly_rewrite, "vip9.eu-west.cachefly.net").unwrap(), "rvip9-dstack.eu-west.cachefly.net");
+        assert_eq!(
+            rw(cachefly_rewrite, "rvip1.g.cachefly.net").unwrap(),
+            "rvip1-dstack.g.cachefly.net"
+        );
+        assert_eq!(
+            rw(cachefly_rewrite, "vip1.g-anycast1.cachefly.net").unwrap(),
+            "rvip1-dstack.g.cachefly.net"
+        );
+        assert_eq!(
+            rw(cachefly_rewrite, "rvip33.g.cachefly.net").unwrap(),
+            "rvip33-dstack.g.cachefly.net"
+        );
+        assert_eq!(
+            rw(cachefly_rewrite, "vip9.eu-west.cachefly.net").unwrap(),
+            "rvip9-dstack.eu-west.cachefly.net"
+        );
         assert!(rw(cachefly_rewrite, "cachefly.cachefly.net").is_none());
         assert!(rw(cachefly_rewrite, "www.cachefly.com").is_none());
     }
 
     #[test]
     fn cachefly_ip() {
-        assert_eq!(cachefly_v4to6("205.234.175.136".parse().unwrap()).unwrap(), "2605:4c40::175:136".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(
+            cachefly_v4to6("205.234.175.136".parse().unwrap()).unwrap(),
+            "2605:4c40::175:136".parse::<Ipv6Addr>().unwrap()
+        );
     }
 
     #[test]
     fn s3() {
         let cases = [
             ("s3.amazonaws.com", "s3.dualstack.us-east-1.amazonaws.com"),
-            ("s3-1-w.amazonaws.com", "s3-r-w.dualstack.us-east-1.amazonaws.com"),
-            ("s3-r-w.amazonaws.com", "s3-r-w.dualstack.us-east-1.amazonaws.com"),
-            ("s3-w.amazonaws.com", "s3-w.dualstack.us-east-1.amazonaws.com"),
-            ("redditstatic.s3.amazonaws.com", "redditstatic.s3.dualstack.us-east-1.amazonaws.com"),
-            ("github-production-release-asset-2e65be.s3.amazonaws.com", "github-production-release-asset-2e65be.s3.dualstack.us-east-1.amazonaws.com"),
-            ("2020awsreinvent.s3-us-west-2.amazonaws.com", "2020awsreinvent.s3.dualstack.us-west-2.amazonaws.com"),
-            ("s3-accesspoint.us-east-2.amazonaws.com", "s3-accesspoint.dualstack.us-east-2.amazonaws.com"),
-            ("s3-accelerate-speedtest.s3-accelerate.amazonaws.com", "s3-accelerate-speedtest.s3-accelerate.dualstack.amazonaws.com"),
-            ("cheetah-test-us-east-1-02.s3-accelerate.amazonaws.com", "cheetah-test-us-east-1-02.s3-accelerate.dualstack.amazonaws.com"),
-            ("s3.eu-central-1.amazonaws.com", "s3.dualstack.eu-central-1.amazonaws.com"),
-            ("account-id.s3-control.eu-central-1.amazonaws.com", "account-id.s3-control.dualstack.eu-central-1.amazonaws.com"),
-            ("s3-accesspoint.eu-central-1.amazonaws.com", "s3-accesspoint.dualstack.eu-central-1.amazonaws.com"),
-            ("web.s3-accesspoint.eu-central-1.amazonaws.com", "web.s3-accesspoint.dualstack.eu-central-1.amazonaws.com"),
-            ("s3.cn-north-1.amazonaws.com.cn", "s3.dualstack.cn-north-1.amazonaws.com.cn"),
-            ("account-id.s3-control.cn-north-1.amazonaws.com.cn", "account-id.s3-control.dualstack.cn-north-1.amazonaws.com.cn"),
-            ("web.s3-accesspoint.cn-north-1.amazonaws.com.cn", "web.s3-accesspoint.dualstack.cn-north-1.amazonaws.com.cn"),
-            ("s3.ap-southeast-1.amazonaws.com", "s3.dualstack.ap-southeast-1.amazonaws.com"),
-            ("download.opencontent.netflix.com.s3.amazonaws.com", "download.opencontent.netflix.com.s3.dualstack.us-east-1.amazonaws.com"),
-            ("s3-website-us-east-1.amazonaws.com", "s3-website.dualstack.us-east-1.amazonaws.com"),
-            ("s3-website.ap-southeast-3.amazonaws.com", "s3-website.dualstack.ap-southeast-3.amazonaws.com"),
+            (
+                "s3-1-w.amazonaws.com",
+                "s3-r-w.dualstack.us-east-1.amazonaws.com",
+            ),
+            (
+                "s3-r-w.amazonaws.com",
+                "s3-r-w.dualstack.us-east-1.amazonaws.com",
+            ),
+            (
+                "s3-w.amazonaws.com",
+                "s3-w.dualstack.us-east-1.amazonaws.com",
+            ),
+            (
+                "redditstatic.s3.amazonaws.com",
+                "redditstatic.s3.dualstack.us-east-1.amazonaws.com",
+            ),
+            (
+                "github-production-release-asset-2e65be.s3.amazonaws.com",
+                "github-production-release-asset-2e65be.s3.dualstack.us-east-1.amazonaws.com",
+            ),
+            (
+                "2020awsreinvent.s3-us-west-2.amazonaws.com",
+                "2020awsreinvent.s3.dualstack.us-west-2.amazonaws.com",
+            ),
+            (
+                "s3-accesspoint.us-east-2.amazonaws.com",
+                "s3-accesspoint.dualstack.us-east-2.amazonaws.com",
+            ),
+            (
+                "s3-accelerate-speedtest.s3-accelerate.amazonaws.com",
+                "s3-accelerate-speedtest.s3-accelerate.dualstack.amazonaws.com",
+            ),
+            (
+                "cheetah-test-us-east-1-02.s3-accelerate.amazonaws.com",
+                "cheetah-test-us-east-1-02.s3-accelerate.dualstack.amazonaws.com",
+            ),
+            (
+                "s3.eu-central-1.amazonaws.com",
+                "s3.dualstack.eu-central-1.amazonaws.com",
+            ),
+            (
+                "account-id.s3-control.eu-central-1.amazonaws.com",
+                "account-id.s3-control.dualstack.eu-central-1.amazonaws.com",
+            ),
+            (
+                "s3-accesspoint.eu-central-1.amazonaws.com",
+                "s3-accesspoint.dualstack.eu-central-1.amazonaws.com",
+            ),
+            (
+                "web.s3-accesspoint.eu-central-1.amazonaws.com",
+                "web.s3-accesspoint.dualstack.eu-central-1.amazonaws.com",
+            ),
+            (
+                "s3.cn-north-1.amazonaws.com.cn",
+                "s3.dualstack.cn-north-1.amazonaws.com.cn",
+            ),
+            (
+                "account-id.s3-control.cn-north-1.amazonaws.com.cn",
+                "account-id.s3-control.dualstack.cn-north-1.amazonaws.com.cn",
+            ),
+            (
+                "web.s3-accesspoint.cn-north-1.amazonaws.com.cn",
+                "web.s3-accesspoint.dualstack.cn-north-1.amazonaws.com.cn",
+            ),
+            (
+                "s3.ap-southeast-1.amazonaws.com",
+                "s3.dualstack.ap-southeast-1.amazonaws.com",
+            ),
+            (
+                "download.opencontent.netflix.com.s3.amazonaws.com",
+                "download.opencontent.netflix.com.s3.dualstack.us-east-1.amazonaws.com",
+            ),
+            (
+                "s3-website-us-east-1.amazonaws.com",
+                "s3-website.dualstack.us-east-1.amazonaws.com",
+            ),
+            (
+                "s3-website.ap-southeast-3.amazonaws.com",
+                "s3-website.dualstack.ap-southeast-3.amazonaws.com",
+            ),
         ];
         for (input, want) in cases {
             assert_eq!(rw(s3_rewrite, input).as_deref(), Some(want), "s3 {input}");
@@ -922,11 +1250,24 @@ mod tests {
         // must not be the naive dualstack-with-.cn rewrite (dp1 = -1 suppresses
         // re-adding the cn TLD).
         for (input, naive) in [
-            ("2020awsreinvent.s3-us-west-2.amazonaws.com.cn", "2020awsreinvent.s3.dualstack.us-west-2.amazonaws.com.cn"),
-            ("s3-accelerate.amazonaws.com.cn", "s3-accelerate.dualstack.amazonaws.com.cn"),
-            ("s3-website.cn-northwest-1.amazonaws.com.cn", "s3-website.dualstack.cn-northwest-1.amazonaws.com.cn"),
+            (
+                "2020awsreinvent.s3-us-west-2.amazonaws.com.cn",
+                "2020awsreinvent.s3.dualstack.us-west-2.amazonaws.com.cn",
+            ),
+            (
+                "s3-accelerate.amazonaws.com.cn",
+                "s3-accelerate.dualstack.amazonaws.com.cn",
+            ),
+            (
+                "s3-website.cn-northwest-1.amazonaws.com.cn",
+                "s3-website.dualstack.cn-northwest-1.amazonaws.com.cn",
+            ),
         ] {
-            assert_ne!(rw(s3_rewrite, input).as_deref(), Some(naive), "s3 cn {input}");
+            assert_ne!(
+                rw(s3_rewrite, input).as_deref(),
+                Some(naive),
+                "s3 cn {input}"
+            );
         }
     }
 
@@ -934,19 +1275,55 @@ mod tests {
     fn oss() {
         let cases = [
             ("oss.aliyuncs.com", "cn-hangzhou.oss.aliyuncs.com"),
-            ("examplebucket.oss.aliyuncs.com", "cn-hangzhou.oss.aliyuncs.com"),
-            ("example-bucket.oss.aliyuncs.com", "cn-hangzhou.oss.aliyuncs.com"),
-            ("oss-cn-hangzhou.aliyuncs.com", "cn-hangzhou.oss.aliyuncs.com"),
+            (
+                "examplebucket.oss.aliyuncs.com",
+                "cn-hangzhou.oss.aliyuncs.com",
+            ),
+            (
+                "example-bucket.oss.aliyuncs.com",
+                "cn-hangzhou.oss.aliyuncs.com",
+            ),
+            (
+                "oss-cn-hangzhou.aliyuncs.com",
+                "cn-hangzhou.oss.aliyuncs.com",
+            ),
             ("oss-cn-beijing.aliyuncs.com", "cn-beijing.oss.aliyuncs.com"),
-            ("oss-ap-southeast-1.aliyuncs.com", "ap-southeast-1.oss.aliyuncs.com"),
-            ("oss-eu-central-1.aliyuncs.com", "eu-central-1.oss.aliyuncs.com"),
-            ("examplebucket.oss-cn-hangzhou.aliyuncs.com", "cn-hangzhou.oss.aliyuncs.com"),
-            ("examplebucket.cn-hangzhou.oss.aliyun-inc.com", "examplebucket.cn-hangzhou.oss.aliyuncs.com"),
-            ("examplebucket.ap-southeast-1.oss.aliyun-inc.com", "examplebucket.ap-southeast-1.oss.aliyuncs.com"),
-            ("cn-hangzhou.oss.aliyuncs.com", "cn-hangzhou.oss.aliyuncs.com"),
-            ("examplebucket.cn-hangzhou.oss.aliyuncs.com", "examplebucket.cn-hangzhou.oss.aliyuncs.com"),
-            ("examplebucket.eu-central-1.oss.aliyuncs.com", "examplebucket.eu-central-1.oss.aliyuncs.com"),
-            ("alicloud-common.oss-ap-southeast-1.aliyuncs.com", "ap-southeast-1.oss.aliyuncs.com"),
+            (
+                "oss-ap-southeast-1.aliyuncs.com",
+                "ap-southeast-1.oss.aliyuncs.com",
+            ),
+            (
+                "oss-eu-central-1.aliyuncs.com",
+                "eu-central-1.oss.aliyuncs.com",
+            ),
+            (
+                "examplebucket.oss-cn-hangzhou.aliyuncs.com",
+                "cn-hangzhou.oss.aliyuncs.com",
+            ),
+            (
+                "examplebucket.cn-hangzhou.oss.aliyun-inc.com",
+                "examplebucket.cn-hangzhou.oss.aliyuncs.com",
+            ),
+            (
+                "examplebucket.ap-southeast-1.oss.aliyun-inc.com",
+                "examplebucket.ap-southeast-1.oss.aliyuncs.com",
+            ),
+            (
+                "cn-hangzhou.oss.aliyuncs.com",
+                "cn-hangzhou.oss.aliyuncs.com",
+            ),
+            (
+                "examplebucket.cn-hangzhou.oss.aliyuncs.com",
+                "examplebucket.cn-hangzhou.oss.aliyuncs.com",
+            ),
+            (
+                "examplebucket.eu-central-1.oss.aliyuncs.com",
+                "examplebucket.eu-central-1.oss.aliyuncs.com",
+            ),
+            (
+                "alicloud-common.oss-ap-southeast-1.aliyuncs.com",
+                "ap-southeast-1.oss.aliyuncs.com",
+            ),
         ];
         for (input, want) in cases {
             assert_eq!(rw(oss_rewrite, input).as_deref(), Some(want), "oss {input}");
@@ -956,18 +1333,49 @@ mod tests {
     #[test]
     fn oracle() {
         let cases = [
-            ("objectstorage.us-ashburn-1.oci.customer-oci.com", "objectstorage.us-ashburn-1.ds.oci.customer-oci.com"),
-            ("adwc4pm.objectstorage.us-ashburn-1.oci.customer-oci.com", "adwc4pm.objectstorage.us-ashburn-1.ds.oci.customer-oci.com"),
-            ("objectstorage.us-phoenix-1.oraclecloud.com", "objectstorage.us-phoenix-1.ds.oci.customer-oci.com"),
-            ("objectstorage.us-phoenix-1.ds.oraclecloud.com", "objectstorage.us-phoenix-1.ds.oraclecloud.com"),
-            ("compat.objectstorage.ap-mumbai-1.oraclecloud.com", "objectstorage.ap-mumbai-1.ds.oci.customer-oci.com"),
-            ("bmkltsly13vb.compat.objectstorage.ap-mumbai-1.oraclecloud.com", "bmkltsly13vb.compat.objectstorage.ap-mumbai-1.ds.oci.customer-oci.com"),
-            ("namespace.compat.objectstorage.us-phoenix-1.oci.customer-oci.com", "namespace.compat.objectstorage.us-phoenix-1.ds.oci.customer-oci.com"),
-            ("swiftobjectstorage.us-ashburn-1.oci.customer-oci.com", "swiftobjectstorage.us-ashburn-1.ds.oci.customer-oci.com"),
-            ("namespace.swiftobjectstorage.us-ashburn-1.oci.customer-oci.com", "namespace.swiftobjectstorage.us-ashburn-1.ds.oci.customer-oci.com"),
+            (
+                "objectstorage.us-ashburn-1.oci.customer-oci.com",
+                "objectstorage.us-ashburn-1.ds.oci.customer-oci.com",
+            ),
+            (
+                "adwc4pm.objectstorage.us-ashburn-1.oci.customer-oci.com",
+                "adwc4pm.objectstorage.us-ashburn-1.ds.oci.customer-oci.com",
+            ),
+            (
+                "objectstorage.us-phoenix-1.oraclecloud.com",
+                "objectstorage.us-phoenix-1.ds.oci.customer-oci.com",
+            ),
+            (
+                "objectstorage.us-phoenix-1.ds.oraclecloud.com",
+                "objectstorage.us-phoenix-1.ds.oraclecloud.com",
+            ),
+            (
+                "compat.objectstorage.ap-mumbai-1.oraclecloud.com",
+                "objectstorage.ap-mumbai-1.ds.oci.customer-oci.com",
+            ),
+            (
+                "bmkltsly13vb.compat.objectstorage.ap-mumbai-1.oraclecloud.com",
+                "bmkltsly13vb.compat.objectstorage.ap-mumbai-1.ds.oci.customer-oci.com",
+            ),
+            (
+                "namespace.compat.objectstorage.us-phoenix-1.oci.customer-oci.com",
+                "namespace.compat.objectstorage.us-phoenix-1.ds.oci.customer-oci.com",
+            ),
+            (
+                "swiftobjectstorage.us-ashburn-1.oci.customer-oci.com",
+                "swiftobjectstorage.us-ashburn-1.ds.oci.customer-oci.com",
+            ),
+            (
+                "namespace.swiftobjectstorage.us-ashburn-1.oci.customer-oci.com",
+                "namespace.swiftobjectstorage.us-ashburn-1.ds.oci.customer-oci.com",
+            ),
         ];
         for (input, want) in cases {
-            assert_eq!(rw(oracle_rewrite, input).as_deref(), Some(want), "oracle {input}");
+            assert_eq!(
+                rw(oracle_rewrite, input).as_deref(),
+                Some(want),
+                "oracle {input}"
+            );
         }
         assert_eq!(rw(oracle_rewrite, "www.oracle.com"), None);
         assert_eq!(rw(oracle_rewrite, "oraclecloud.com"), None);
@@ -986,7 +1394,10 @@ mod tests {
     #[test]
     fn fastly_fuse_places_low_bits() {
         let p: Ipv6Addr = "2a04:4e42::".parse().unwrap();
-        assert_eq!(fastly_fuse(p, 396).unwrap(), "2a04:4e42::396".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(
+            fastly_fuse(p, 396).unwrap(),
+            "2a04:4e42::396".parse::<Ipv6Addr>().unwrap()
+        );
     }
 
     #[test]
@@ -1000,6 +1411,9 @@ mod tests {
         };
         let plan = s.detect(&ctx).unwrap();
         let out = (plan.combine)(&[], &ctx.a_addrs());
-        assert_eq!(out, vec!["2a04:fa87:fffd::c000:4205".parse::<Ipv6Addr>().unwrap()]);
+        assert_eq!(
+            out,
+            vec!["2a04:fa87:fffd::c000:4205".parse::<Ipv6Addr>().unwrap()]
+        );
     }
 }

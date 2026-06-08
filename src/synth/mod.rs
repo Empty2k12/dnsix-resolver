@@ -1,7 +1,7 @@
 //! AAAA synthesis: the pluggable Synthesizer chain.
 //!
-//! A `Synthesizer` is the seam: a *pure* rule that, given a name and its 
-//! upstream context, may produce AAAA records for an AAAA-NODATA name. 
+//! A `Synthesizer` is the seam: a *pure* rule that, given a name and its
+//! upstream context, may produce AAAA records for an AAAA-NODATA name.
 //! It performs no DNS lookups itself — it returns a [`Plan`] describing
 //! what to resolve and how to combine the result, and the [`Chain`] orchestrator
 //! executes any resolution (through the upstream `Pool`, so the response cache
@@ -87,7 +87,10 @@ pub struct Plan {
 impl Plan {
     /// A plan that resolves nothing and emits a fixed combine.
     fn pure(combine: Combine) -> Self {
-        Plan { resolve: Vec::new(), combine }
+        Plan {
+            resolve: Vec::new(),
+            combine,
+        }
     }
 }
 
@@ -139,7 +142,9 @@ impl Chain {
     ) -> Option<Vec<Record>> {
         let a_addrs = ctx.a_addrs();
         for synth in &self.synths {
-            let Some(plan) = synth.detect(ctx) else { continue };
+            let Some(plan) = synth.detect(ctx) else {
+                continue;
+            };
             if let Some(records) = self.run_plan(&plan, &a_addrs, ctx, pool).await {
                 metrics.synth_hit(synth.id());
                 tracing::debug!(name = %ctx.name, synthesizer = synth.id(), "synthesized AAAA");
@@ -295,10 +300,7 @@ fn make_synthesizer(id: &str, nat64_prefix: Ipv6Addr) -> Option<Box<dyn Synthesi
 /// Hard precedence constraints: `(a, b)` means a more-specific Provider `a` must
 /// run before the generic `b` it would otherwise be shadowed by (both share the
 /// generic's IP space / hostname space).
-const PRECEDES: &[(&str, &str)] = &[
-    ("shopify", "cloudflare"),
-    ("webflow", "cloudflare"),
-];
+const PRECEDES: &[(&str, &str)] = &[("shopify", "cloudflare"), ("webflow", "cloudflare")];
 
 /// Validate the configured order: unknown ids are caught later in `build`; here
 /// we enforce specific-before-generic and warn if `nat64` is not last.
@@ -342,7 +344,11 @@ pub(crate) fn labels(name: &Name) -> Vec<String> {
 /// Whether `name`'s trailing labels equal `suffix` (already lowercase).
 pub(crate) fn ends_with(name: &Name, suffix: &[&str]) -> bool {
     let l = labels(name);
-    l.len() >= suffix.len() && l[l.len() - suffix.len()..].iter().zip(suffix).all(|(a, b)| a == b)
+    l.len() >= suffix.len()
+        && l[l.len() - suffix.len()..]
+            .iter()
+            .zip(suffix)
+            .all(|(a, b)| a == b)
 }
 
 /// Parse a (possibly non-FQDN) string into an absolute `Name`.
@@ -399,7 +405,10 @@ mod tests {
     fn cidr_matching() {
         assert!(in_cidr("151.101.1.140".parse().unwrap(), "151.101.0.0/16"));
         assert!(!in_cidr("151.102.1.140".parse().unwrap(), "151.101.0.0/16"));
-        assert!(in_cidr("185.199.108.1".parse().unwrap(), "185.199.108.0/22"));
+        assert!(in_cidr(
+            "185.199.108.1".parse().unwrap(),
+            "185.199.108.0/22"
+        ));
         assert!(in_any(
             "104.16.5.5".parse().unwrap(),
             &["162.159.128.0/17", "104.16.0.0/12"]

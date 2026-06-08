@@ -6,8 +6,7 @@ use serde::Deserialize;
 
 /// The well-known NAT64 prefix (RFC 6052 / RFC 6147), the default and the prefix
 /// this operator runs.
-pub const WELL_KNOWN_NAT64_PREFIX: Ipv6Addr =
-    Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0, 0);
+pub const WELL_KNOWN_NAT64_PREFIX: Ipv6Addr = Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0, 0);
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -114,17 +113,15 @@ mod tests {
         let cfg = Config::from_toml("upstreams = [\"192.0.2.1:53\"]").unwrap();
         assert_eq!(cfg.metrics_listen, None);
 
-        let cfg = Config::from_toml(
-            "metrics_listen = \"[::]:9153\"\nupstreams = [\"192.0.2.1:53\"]",
-        )
-        .unwrap();
+        let cfg =
+            Config::from_toml("metrics_listen = \"[::]:9153\"\nupstreams = [\"192.0.2.1:53\"]")
+                .unwrap();
         assert_eq!(cfg.metrics_listen, "[::]:9153".parse().ok());
     }
 
     #[test]
     fn cache_can_be_disabled() {
-        let cfg =
-            Config::from_toml("cache_size = 0\nupstreams = [\"192.0.2.1:53\"]").unwrap();
+        let cfg = Config::from_toml("cache_size = 0\nupstreams = [\"192.0.2.1:53\"]").unwrap();
         assert_eq!(cfg.cache_size, 0);
     }
 
@@ -143,10 +140,9 @@ mod tests {
 
     #[test]
     fn rejects_non_96_prefix() {
-        let err = Config::from_toml(
-            "nat64_prefix = \"64:ff9b::1\"\nupstreams = [\"192.0.2.1:53\"]",
-        )
-        .unwrap_err();
+        let err =
+            Config::from_toml("nat64_prefix = \"64:ff9b::1\"\nupstreams = [\"192.0.2.1:53\"]")
+                .unwrap_err();
         assert!(err.to_string().contains("/96"));
     }
 }

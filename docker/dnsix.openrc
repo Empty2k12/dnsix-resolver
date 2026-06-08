@@ -1,0 +1,17 @@
+#!/sbin/openrc-run
+
+name="dnsix"
+description="Rust DNS64 with CDN Ipv& Tricks"
+
+command="/usr/local/bin/dnsix"
+command_args="--config /etc/dnsix/config.toml"
+command_background=true
+pidfile="/run/dnsix.pid"
+output_log="/var/log/dnsix.log"
+error_log="/var/log/dnsix.log"
+
+depend() {
+	need net
+	use dns logger
+	after firewall
+}

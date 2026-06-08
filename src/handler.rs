@@ -33,7 +33,11 @@ pub struct Dns64Handler {
 
 impl Dns64Handler {
     pub fn new(pool: Arc<Pool>, chain: Arc<Chain>, metrics: Arc<Metrics>) -> Self {
-        Self { pool, chain, metrics }
+        Self {
+            pool,
+            chain,
+            metrics,
+        }
     }
 
     /// The DNS64 synthesis path: parallel AAAA + A, decide, relay or synthesize.

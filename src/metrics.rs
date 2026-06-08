@@ -102,7 +102,12 @@ impl Metrics {
             .collect();
         let synth_hits = synth_ids.iter().map(|_| AtomicU64::new(0)).collect();
         let qtype_counts = QTYPE_LABELS.iter().map(|_| AtomicU64::new(0)).collect();
-        Self { c: Counters::default(), synth_ids, synth_hits, qtype_counts }
+        Self {
+            c: Counters::default(),
+            synth_ids,
+            synth_hits,
+            qtype_counts,
+        }
     }
 
     pub fn inc_queries_dns64(&self) {
@@ -170,22 +175,39 @@ impl Metrics {
         let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
         let mut s = String::with_capacity(2048);
 
-        let _ = writeln!(s, "# HELP dns_queries_total DNS queries handled, by processing kind.");
+        let _ = writeln!(
+            s,
+            "# HELP dns_queries_total DNS queries handled, by processing kind."
+        );
         let _ = writeln!(s, "# TYPE dns_queries_total counter");
-        let _ = writeln!(s, "dns_queries_total{{kind=\"dns64\"}} {}", g(&self.c.queries_dns64));
+        let _ = writeln!(
+            s,
+            "dns_queries_total{{kind=\"dns64\"}} {}",
+            g(&self.c.queries_dns64)
+        );
         let _ = writeln!(
             s,
             "dns_queries_total{{kind=\"passthrough\"}} {}",
             g(&self.c.queries_passthrough)
         );
 
-        let _ = writeln!(s, "# HELP dns_queries_by_qtype_total DNS queries handled, by query type.");
+        let _ = writeln!(
+            s,
+            "# HELP dns_queries_by_qtype_total DNS queries handled, by query type."
+        );
         let _ = writeln!(s, "# TYPE dns_queries_by_qtype_total counter");
         for (label, a) in QTYPE_LABELS.iter().zip(&self.qtype_counts) {
-            let _ = writeln!(s, "dns_queries_by_qtype_total{{qtype=\"{label}\"}} {}", g(a));
+            let _ = writeln!(
+                s,
+                "dns_queries_by_qtype_total{{qtype=\"{label}\"}} {}",
+                g(a)
+            );
         }
 
-        let _ = writeln!(s, "# HELP dns_responses_total Responses sent to clients, by RCODE.");
+        let _ = writeln!(
+            s,
+            "# HELP dns_responses_total Responses sent to clients, by RCODE."
+        );
         let _ = writeln!(s, "# TYPE dns_responses_total counter");
         for (label, a) in [
             ("noerror", &self.c.rcode.noerror),
@@ -305,7 +327,11 @@ async fn handle_conn(mut stream: TcpStream, metrics: Arc<Metrics>) -> std::io::R
             metrics.render_prometheus(),
         )
     } else {
-        ("404 Not Found", "text/plain; charset=utf-8", "not found\n".to_string())
+        (
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            "not found\n".to_string(),
+        )
     };
 
     let response = format!(
