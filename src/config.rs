@@ -47,6 +47,14 @@ pub struct Config {
     /// (e.g. `[::]:9153`).
     #[serde(default)]
     pub metrics_listen: Option<SocketAddr>,
+
+    /// Log verbosity, as a `tracing` env-filter directive (e.g. `"off"`, `"warn"`,
+    /// `"info"`, `"debug"`, or per-target like `"dnsix=debug"`). Logging is opt-in:
+    /// the default is `"off"`, so nothing is written unless you raise it. The
+    /// `RUST_LOG` environment variable, if set, overrides this. Fatal startup
+    /// errors are always reported on stderr regardless of this setting.
+    #[serde(default = "default_log")]
+    pub log: String,
 }
 
 fn default_listen() -> SocketAddr {
@@ -63,6 +71,10 @@ fn default_cache_size() -> usize {
 
 fn default_synthesizers() -> Vec<String> {
     vec!["nat64".to_string()]
+}
+
+fn default_log() -> String {
+    "off".to_string()
 }
 
 impl Config {
@@ -117,6 +129,15 @@ mod tests {
             Config::from_toml("metrics_listen = \"[::]:9153\"\nupstreams = [\"192.0.2.1:53\"]")
                 .unwrap();
         assert_eq!(cfg.metrics_listen, "[::]:9153".parse().ok());
+    }
+
+    #[test]
+    fn log_defaults_off_and_parses() {
+        let cfg = Config::from_toml("upstreams = [\"192.0.2.1:53\"]").unwrap();
+        assert_eq!(cfg.log, "off");
+
+        let cfg = Config::from_toml("log = \"dnsix=debug\"\nupstreams = [\"192.0.2.1:53\"]").unwrap();
+        assert_eq!(cfg.log, "dnsix=debug");
     }
 
     #[test]

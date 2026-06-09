@@ -1,0 +1,409 @@
+zabbix_export:
+  version: '7.0'
+  template_groups:
+    - uuid: 11bd37ca5217471a9184e78517593ae1
+      name: Templates/Applications
+  templates:
+    - uuid: 2f3fcda4a9d94bd3ab66202bd4f10ba0
+      template: 'dnsix by HTTP'
+      name: 'dnsix DNS64 forwarder by HTTP'
+      description: |
+        Scrapes the dnsix Prometheus metrics endpoint (GET /metrics, exposition
+        version 0.0.4) with a single HTTP-agent master item. Everything else is a
+        dependent item or a low-level-discovery (LLD) rule driven by Prometheus
+        preprocessing, so the endpoint is hit exactly once per interval.
+
+        Every counter is stored as a PER-SECOND RATE: the dnsix counters are
+        monotonic, so each item has a "Change per second" preprocessing step after
+        the Prometheus-pattern extraction and is value_type FLOAT. A process restart
+        resets the counter to 0; "Change per second" discards that one negative delta
+        and resumes on the next sample, so restarts cost a single missed point rather
+        than a huge spike.
+
+        Four label-bearing metric families are discovered automatically:
+          - dns_queries_total{kind=...}            -> {#KIND}
+          - dns_queries_by_qtype_total{qtype=...}  -> {#QTYPE}
+          - dns_responses_total{rcode=...}         -> {#RCODE}
+          - synth_hits_total{synthesizer=...}      -> {#SYNTHESIZER}
+
+        The synthesizer family is a stable set (one series per ENABLED synthesizer,
+        config order, including nat64), so new CDN providers appear as items with no
+        template edit. See docs/adr/0004-metrics-endpoint.md.
+
+        Endpoint is unauthenticated; point the macros at a loopback/trusted bind.
+      groups:
+        - name: Templates/Applications
+      macros:
+        - macro: '{$DNSIX.METRICS.HOST}'
+          value: '[::1]'
+          description: |
+            Host/address of the metrics endpoint. IPv6 literals MUST be bracketed
+            for the URL, e.g. [2001:db8::1] or [::1] (this deployment is IPv6-only).
+        - macro: '{$DNSIX.METRICS.PORT}'
+          value: '9153'
+          description: 'Port of the metrics endpoint (matches config metrics_listen).'
+        - macro: '{$DNSIX.UPSTREAM.FAIL.WINDOW}'
+          value: '5m'
+          description: 'Window over which any upstream-failure rate raises the trigger.'
+      items:
+        - uuid: e2e77323079a4646a0211d1a0e63d7f1
+          name: 'dnsix: Get metrics'
+          type: HTTP_AGENT
+          key: dnsix.get_metrics
+          delay: '60s'
+          history: '0'
+          trends: '0'
+          value_type: TEXT
+          url: 'http://{$DNSIX.METRICS.HOST}:{$DNSIX.METRICS.PORT}/metrics'
+          description: |
+            Master item: the single scrape of GET /metrics. All other items depend
+            on this one. Raw exposition text is not kept (history 0); the parsed
+            dependent items carry the numbers.
+          tags:
+            - tag: component
+              value: raw
+        - uuid: 20b82d0fca964704b5e40e0ca45b8029
+          name: 'dnsix: Upstream failure rate (all upstreams failed)'
+          type: DEPENDENT
+          key: dnsix.upstream_failed_total
+          value_type: FLOAT
+          units: '!/s'
+          description: 'Per-second rate of queries where every upstream failed (client got SERVFAIL).'
+          master_item:
+            key: dnsix.get_metrics
+          preprocessing:
+            - type: PROMETHEUS_PATTERN
+              parameters:
+                - 'dns_upstream_failed_total'
+                - value
+                - ''
+            - type: CHANGE_PER_SECOND
+              parameters:
+                - ''
+          tags:
+            - tag: component
+              value: forwarding
+        - uuid: d44bcc043e3742a188681f5a43194c1d
+          name: 'dnsix: Cache hit rate'
+          type: DEPENDENT
+          key: dnsix.cache_hits_total
+          value_type: FLOAT
+          units: '!/s'
+          description: 'Per-second rate of response-cache hits over all pool lookups (incl. internal AAAA reference lookups).'
+          master_item:
+            key: dnsix.get_metrics
+          preprocessing:
+            - type: PROMETHEUS_PATTERN
+              parameters:
+                - 'dns_cache_hits_total'
+                - value
+                - ''
+            - type: CHANGE_PER_SECOND
+              parameters:
+                - ''
+          tags:
+            - tag: component
+              value: cache
+        - uuid: b805baad4fb6400e984bbec3864b686d
+          name: 'dnsix: Cache miss rate'
+          type: DEPENDENT
+          key: dnsix.cache_misses_total
+          value_type: FLOAT
+          units: '!/s'
+          description: 'Per-second rate of response-cache misses for cacheable queries.'
+          master_item:
+            key: dnsix.get_metrics
+          preprocessing:
+            - type: PROMETHEUS_PATTERN
+              parameters:
+                - 'dns_cache_misses_total'
+                - value
+                - ''
+            - type: CHANGE_PER_SECOND
+              parameters:
+                - ''
+          tags:
+            - tag: component
+              value: cache
+        - uuid: 084939a807774f4ebbcde1cfe3b32c1f
+          name: 'dnsix: DNS64 native AAAA relayed (rate)'
+          type: DEPENDENT
+          key: dnsix.dns64_native_aaaa_total
+          value_type: FLOAT
+          units: '!/s'
+          description: 'Per-second rate of AAAA queries relayed because a native AAAA existed.'
+          master_item:
+            key: dnsix.get_metrics
+          preprocessing:
+            - type: PROMETHEUS_PATTERN
+              parameters:
+                - 'dns64_native_aaaa_total'
+                - value
+                - ''
+            - type: CHANGE_PER_SECOND
+              parameters:
+                - ''
+          tags:
+            - tag: component
+              value: dns64
+        - uuid: e5595ea3cabc436e8ca3a8202f653ce3
+          name: 'dnsix: DNS64 NXDOMAIN (rate)'
+          type: DEPENDENT
+          key: dnsix.dns64_nxdomain_total
+          value_type: FLOAT
+          units: '!/s'
+          description: 'Per-second rate of AAAA queries that resolved to NXDOMAIN.'
+          master_item:
+            key: dnsix.get_metrics
+          preprocessing:
+            - type: PROMETHEUS_PATTERN
+              parameters:
+                - 'dns64_nxdomain_total'
+                - value
+                - ''
+            - type: CHANGE_PER_SECOND
+              parameters:
+                - ''
+          tags:
+            - tag: component
+              value: dns64
+        - uuid: c653492ad7754fcebce73ba9573f8507
+          name: 'dnsix: DNS64 NODATA entered chain (rate)'
+          type: DEPENDENT
+          key: dnsix.dns64_nodata_total
+          value_type: FLOAT
+          units: '!/s'
+          description: 'Per-second rate of AAAA-NODATA queries that entered the synthesizer chain.'
+          master_item:
+            key: dnsix.get_metrics
+          preprocessing:
+            - type: PROMETHEUS_PATTERN
+              parameters:
+                - 'dns64_nodata_total'
+                - value
+                - ''
+            - type: CHANGE_PER_SECOND
+              parameters:
+                - ''
+          tags:
+            - tag: component
+              value: dns64
+        - uuid: 2dcc95d942de4b2592e447fee2345b7c
+          name: 'dnsix: DNS64 synthesized (rate)'
+          type: DEPENDENT
+          key: dnsix.dns64_synthesized_total
+          value_type: FLOAT
+          units: '!/s'
+          description: 'Per-second rate of AAAA-NODATA queries where the chain produced records.'
+          master_item:
+            key: dnsix.get_metrics
+          preprocessing:
+            - type: PROMETHEUS_PATTERN
+              parameters:
+                - 'dns64_synthesized_total'
+                - value
+                - ''
+            - type: CHANGE_PER_SECOND
+              parameters:
+                - ''
+          tags:
+            - tag: component
+              value: dns64
+        - uuid: 711923e0b528491a970e1a7fe70ed8ca
+          name: 'dnsix: DNS64 honest empty answer (rate)'
+          type: DEPENDENT
+          key: dnsix.dns64_empty_total
+          value_type: FLOAT
+          units: '!/s'
+          description: 'Per-second rate of AAAA-NODATA queries where the chain produced nothing (honest empty answer).'
+          master_item:
+            key: dnsix.get_metrics
+          preprocessing:
+            - type: PROMETHEUS_PATTERN
+              parameters:
+                - 'dns64_empty_total'
+                - value
+                - ''
+            - type: CHANGE_PER_SECOND
+              parameters:
+                - ''
+          tags:
+            - tag: component
+              value: dns64
+      discovery_rules:
+        - uuid: e608d9a0a74f4d9ab1443f7f73548054
+          name: 'dnsix: Discover query kinds'
+          type: DEPENDENT
+          key: dnsix.queries.kind.discovery
+          delay: '0'
+          lifetime: '7d'
+          description: 'Discovers dns_queries_total series by their {kind} label (dns64, passthrough).'
+          master_item:
+            key: dnsix.get_metrics
+          preprocessing:
+            - type: PROMETHEUS_TO_JSON
+              parameters:
+                - 'dns_queries_total'
+          lld_macro_paths:
+            - lld_macro: '{#KIND}'
+              path: '$.labels.kind'
+          item_prototypes:
+            - uuid: ae0edf3d187248c88517ef5d415f0e1c
+              name: 'dnsix: Query rate [{#KIND}]'
+              type: DEPENDENT
+              key: 'dnsix.queries[{#KIND}]'
+              value_type: FLOAT
+              units: '!/s'
+              description: 'Per-second rate of DNS queries handled with processing kind {#KIND}.'
+              master_item:
+                key: dnsix.get_metrics
+              preprocessing:
+                - type: PROMETHEUS_PATTERN
+                  parameters:
+                    - 'dns_queries_total{kind="{#KIND}"}'
+                    - value
+                    - ''
+                - type: CHANGE_PER_SECOND
+                  parameters:
+                    - ''
+              tags:
+                - tag: component
+                  value: forwarding
+                - tag: kind
+                  value: '{#KIND}'
+        - uuid: 0b77b08fe6fa4dbdbab8dddb02cba3b4
+          name: 'dnsix: Discover query types'
+          type: DEPENDENT
+          key: dnsix.queries.qtype.discovery
+          delay: '0'
+          lifetime: '7d'
+          description: 'Discovers dns_queries_by_qtype_total series by their {qtype} label (A, AAAA, ... other).'
+          master_item:
+            key: dnsix.get_metrics
+          preprocessing:
+            - type: PROMETHEUS_TO_JSON
+              parameters:
+                - 'dns_queries_by_qtype_total'
+          lld_macro_paths:
+            - lld_macro: '{#QTYPE}'
+              path: '$.labels.qtype'
+          item_prototypes:
+            - uuid: 9428de361e5c4e31ad21f1299ad4885b
+              name: 'dnsix: Query rate by qtype [{#QTYPE}]'
+              type: DEPENDENT
+              key: 'dnsix.queries_by_qtype[{#QTYPE}]'
+              value_type: FLOAT
+              units: '!/s'
+              description: 'Per-second rate of DNS queries handled for query type {#QTYPE}.'
+              master_item:
+                key: dnsix.get_metrics
+              preprocessing:
+                - type: PROMETHEUS_PATTERN
+                  parameters:
+                    - 'dns_queries_by_qtype_total{qtype="{#QTYPE}"}'
+                    - value
+                    - ''
+                - type: CHANGE_PER_SECOND
+                  parameters:
+                    - ''
+              tags:
+                - tag: component
+                  value: forwarding
+                - tag: qtype
+                  value: '{#QTYPE}'
+        - uuid: 3fa5d5796d7e4e97b67b24f8a1833bac
+          name: 'dnsix: Discover response codes'
+          type: DEPENDENT
+          key: dnsix.responses.rcode.discovery
+          delay: '0'
+          lifetime: '7d'
+          description: 'Discovers dns_responses_total series by their {rcode} label (noerror, nxdomain, servfail, ...).'
+          master_item:
+            key: dnsix.get_metrics
+          preprocessing:
+            - type: PROMETHEUS_TO_JSON
+              parameters:
+                - 'dns_responses_total'
+          lld_macro_paths:
+            - lld_macro: '{#RCODE}'
+              path: '$.labels.rcode'
+          item_prototypes:
+            - uuid: adfc4315aba04bd09cc589f4a784652b
+              name: 'dnsix: Response rate [{#RCODE}]'
+              type: DEPENDENT
+              key: 'dnsix.responses[{#RCODE}]'
+              value_type: FLOAT
+              units: '!/s'
+              description: 'Per-second rate of responses sent to clients with RCODE {#RCODE}.'
+              master_item:
+                key: dnsix.get_metrics
+              preprocessing:
+                - type: PROMETHEUS_PATTERN
+                  parameters:
+                    - 'dns_responses_total{rcode="{#RCODE}"}'
+                    - value
+                    - ''
+                - type: CHANGE_PER_SECOND
+                  parameters:
+                    - ''
+              tags:
+                - tag: component
+                  value: forwarding
+                - tag: rcode
+                  value: '{#RCODE}'
+        - uuid: 306f629f33db4f1f97886b1e1a69e1d1
+          name: 'dnsix: Discover synthesizers'
+          type: DEPENDENT
+          key: dnsix.synth.discovery
+          delay: '0'
+          lifetime: '7d'
+          description: |
+            Discovers synth_hits_total series by their {synthesizer} label. One series
+            per ENABLED synthesizer (config order, incl. nat64); new providers appear
+            automatically.
+          master_item:
+            key: dnsix.get_metrics
+          preprocessing:
+            - type: PROMETHEUS_TO_JSON
+              parameters:
+                - 'synth_hits_total'
+          lld_macro_paths:
+            - lld_macro: '{#SYNTHESIZER}'
+              path: '$.labels.synthesizer'
+          item_prototypes:
+            - uuid: 7df4e0af71404f89809f94f9ca80b937
+              name: 'dnsix: Synthesizer hit rate [{#SYNTHESIZER}]'
+              type: DEPENDENT
+              key: 'dnsix.synth_hits[{#SYNTHESIZER}]'
+              value_type: FLOAT
+              units: '!/s'
+              description: 'Per-second rate of records synthesized by the {#SYNTHESIZER} synthesizer.'
+              master_item:
+                key: dnsix.get_metrics
+              preprocessing:
+                - type: PROMETHEUS_PATTERN
+                  parameters:
+                    - 'synth_hits_total{synthesizer="{#SYNTHESIZER}"}'
+                    - value
+                    - ''
+                - type: CHANGE_PER_SECOND
+                  parameters:
+                    - ''
+              tags:
+                - tag: component
+                  value: synthesizer
+                - tag: synthesizer
+                  value: '{#SYNTHESIZER}'
+  triggers:
+    - uuid: 54304afb74334a7ca5ddd79b390e29b9
+      expression: 'nodata(/dnsix by HTTP/dnsix.get_metrics,5m)=1'
+      name: 'dnsix: Metrics endpoint unreachable'
+      priority: HIGH
+      description: 'No successful scrape of GET /metrics for 5 minutes (process down, bind failed, or firewall).'
+      manual_close: 'YES'
+    - uuid: 67e10a9efb324589b04cac8fe45d69e4
+      expression: 'max(/dnsix by HTTP/dnsix.upstream_failed_total,{$DNSIX.UPSTREAM.FAIL.WINDOW})>0'
+      name: 'dnsix: Upstream failures occurring'
+      priority: AVERAGE
+      description: 'A non-zero upstream-failure rate was seen within the window — at least one query had every upstream fail.'
+      manual_close: 'YES'

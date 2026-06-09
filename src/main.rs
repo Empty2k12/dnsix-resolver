@@ -43,16 +43,21 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
     let args = Args::parse();
     let text = std::fs::read_to_string(&args.config)
         .with_context(|| format!("reading config file {}", args.config.display()))?;
     let cfg = Config::from_toml(&text).context("parsing configuration")?;
+
+    // Logging is opt-in. `RUST_LOG` wins if set; otherwise the config's `log`
+    // directive applies (default `"off"`, i.e. silent). Fatal startup errors are
+    // returned from `main` and printed to stderr regardless of this filter.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .or_else(|_| EnvFilter::try_new(&cfg.log))
+                .unwrap_or_else(|_| EnvFilter::new("off")),
+        )
+        .init();
 
     let chain = Arc::new(Chain::build(
         &cfg.synthesizers,
