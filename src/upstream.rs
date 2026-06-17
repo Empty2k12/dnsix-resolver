@@ -36,6 +36,7 @@
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -50,6 +51,7 @@ use hickory_proto::tcp::TcpClientStream;
 use hickory_proto::udp::UdpClientStream;
 use hickory_proto::xfer::{DnsHandle, DnsResponse};
 use moka::{sync::Cache, Expiry};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
 use crate::config::Upstream as UpstreamConfig;
@@ -83,22 +85,53 @@ const STALE_MAX_WINDOW: Duration = Duration::from_secs(86_400);
 /// same last-10% heuristic).
 const PREFETCH_FRACTION: f64 = 0.10;
 
-/// A single upstream resolver. `Plain` keeps a long-lived UDP and TCP client and
-/// uses UDP with a TCP fallback on truncation; `Tls` (DNS-over-TLS, RFC 7858)
+/// A live set of clients for one upstream. `Plain` keeps a UDP and a TCP client
+/// and uses UDP with a TCP fallback on truncation; `Tls` (DNS-over-TLS, RFC 7858)
 /// keeps a single TLS-over-TCP client — TLS rides TCP, so it never truncates.
-enum Upstream {
-    Plain {
-        addr: SocketAddr,
-        udp: Client,
-        tcp: Client,
-    },
-    Tls {
-        addr: SocketAddr,
-        client: Client,
-    },
+///
+/// Every variant is connection-oriented underneath (even UDP is a long-lived
+/// `Client` driven by a background task), so a dead connection means the whole
+/// `Conn` is discarded and re-dialed by its owning [`Upstream`].
+enum Conn {
+    Plain { udp: Client, tcp: Client },
+    Tls { client: Client },
 }
 
-impl Upstream {
+/// Establishes a fresh [`Connection`] for one upstream on demand. Abstracted so
+/// the reconnect logic in [`Upstream`] can be driven by a fake in tests without
+/// touching the network.
+#[async_trait::async_trait]
+trait Dialer: Send + Sync {
+    async fn dial(&self) -> anyhow::Result<Arc<dyn Connection>>;
+}
+
+/// A live connection that can resolve queries. Real connections are hickory
+/// `Client`s ([`Conn`]); tests substitute a controllable fake.
+#[async_trait::async_trait]
+trait Connection: Send + Sync {
+    async fn resolve(&self, query: Message) -> anyhow::Result<DnsResponse>;
+}
+
+/// The production dialer: (re)connects a [`Conn`] from its config.
+struct NetworkDialer {
+    cfg: UpstreamConfig,
+}
+
+#[async_trait::async_trait]
+impl Dialer for NetworkDialer {
+    async fn dial(&self) -> anyhow::Result<Arc<dyn Connection>> {
+        Ok(Arc::new(Conn::connect(&self.cfg).await?))
+    }
+}
+
+#[async_trait::async_trait]
+impl Connection for Conn {
+    async fn resolve(&self, query: Message) -> anyhow::Result<DnsResponse> {
+        Conn::resolve(self, query).await
+    }
+}
+
+impl Conn {
     async fn connect(cfg: &UpstreamConfig) -> anyhow::Result<Self> {
         match cfg {
             UpstreamConfig::Plain(addr) => Self::connect_plain(*addr).await,
@@ -126,7 +159,7 @@ impl Upstream {
             .with_context(|| format!("connecting TCP client to upstream {addr}"))?;
         tokio::spawn(tcp_bg);
 
-        Ok(Self::Plain { addr, udp, tcp })
+        Ok(Self::Plain { udp, tcp })
     }
 
     /// Connect a DNS-over-TLS (RFC 7858) upstream. `dns_name` is validated against
@@ -146,36 +179,117 @@ impl Upstream {
             .with_context(|| format!("connecting DoT client to upstream {addr} ({dns_name})"))?;
         tokio::spawn(bg);
 
-        Ok(Self::Tls { addr, client })
-    }
-
-    /// The socket address of this upstream, for logging.
-    fn addr(&self) -> SocketAddr {
-        match self {
-            Upstream::Plain { addr, .. } | Upstream::Tls { addr, .. } => *addr,
-        }
+        Ok(Self::Tls { client })
     }
 
     /// Resolve `query`: over UDP with a TCP retry on truncation for a plain
     /// upstream, or over the single TLS client for a DoT upstream.
     async fn resolve(&self, query: Message) -> anyhow::Result<DnsResponse> {
         match self {
-            Upstream::Plain { addr, udp, tcp } => {
-                let resp = send_once(udp, query.clone())
-                    .await
-                    .with_context(|| format!("UDP query to upstream {addr}"))?;
+            Conn::Plain { udp, tcp } => {
+                let resp = send_once(udp, query.clone()).await.context("UDP query")?;
                 if resp.truncated() {
-                    send_once(tcp, query)
-                        .await
-                        .with_context(|| format!("TCP retry to upstream {addr}"))
+                    send_once(tcp, query).await.context("TCP retry")
                 } else {
                     Ok(resp)
                 }
             }
-            Upstream::Tls { addr, client } => send_once(client, query)
-                .await
-                .with_context(|| format!("DoT query to upstream {addr}")),
+            Conn::Tls { client } => send_once(client, query).await.context("DoT query"),
         }
+    }
+}
+
+/// A single upstream resolver that transparently reconnects. The underlying
+/// clients are all connection-oriented and long-lived; DoT and TCP connections
+/// in particular get closed by an idle upstream (Cloudflare and Quad9 both do
+/// this aggressively). hickory's `Client` does not redial — once the connection
+/// dies, the background multiplexer task ends and every later send fails with
+/// `Busy` ("resource too busy") or a disconnected-stream error. Without
+/// reconnection that turns a routine idle-close into a permanent SERVFAIL for
+/// every query until the process restarts.
+///
+/// So the live [`Conn`] sits behind a lazily-(re)established cell: on any send
+/// error we drop the dead connection and redial once, healing a server-side
+/// close on the very next query.
+struct Upstream {
+    dialer: Arc<dyn Dialer>,
+    addr: SocketAddr,
+    /// `(generation, conn)`; `None` before first use and after a failure. The
+    /// async mutex serializes (re)connects, so a burst of concurrent failures
+    /// triggers a single redial rather than a thundering herd.
+    cell: AsyncMutex<Option<(u64, Arc<dyn Connection>)>>,
+    gen: AtomicU64,
+}
+
+impl Upstream {
+    fn new(cfg: &UpstreamConfig) -> Self {
+        let addr = match cfg {
+            UpstreamConfig::Plain(addr) => *addr,
+            UpstreamConfig::Tls { addr, .. } => *addr,
+        };
+        Self::with_dialer(addr, Arc::new(NetworkDialer { cfg: cfg.clone() }))
+    }
+
+    fn with_dialer(addr: SocketAddr, dialer: Arc<dyn Dialer>) -> Self {
+        Self {
+            dialer,
+            addr,
+            cell: AsyncMutex::new(None),
+            gen: AtomicU64::new(0),
+        }
+    }
+
+    /// Build an upstream and dial it once, so a wholly unreachable or
+    /// misconfigured upstream still fails fast at startup.
+    async fn connect(cfg: &UpstreamConfig) -> anyhow::Result<Self> {
+        let upstream = Self::new(cfg);
+        upstream.acquire().await?;
+        Ok(upstream)
+    }
+
+    /// The socket address of this upstream, for logging.
+    fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Return the live connection, dialing one if the cell is empty.
+    async fn acquire(&self) -> anyhow::Result<(u64, Arc<dyn Connection>)> {
+        let mut cell = self.cell.lock().await;
+        if let Some((g, conn)) = cell.as_ref() {
+            return Ok((*g, Arc::clone(conn)));
+        }
+        let conn = self.dialer.dial().await?;
+        let g = self.gen.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        *cell = Some((g, Arc::clone(&conn)));
+        Ok((g, conn))
+    }
+
+    /// Drop the cached connection if it is still generation `g`, so the next
+    /// `acquire` redials. A connection already replaced by a concurrent
+    /// reconnect (newer `g`) is left intact.
+    async fn invalidate(&self, g: u64) {
+        let mut cell = self.cell.lock().await;
+        if matches!(cell.as_ref(), Some((cg, _)) if *cg == g) {
+            *cell = None;
+        }
+    }
+
+    /// Resolve `query`, reconnecting once if the live connection has died.
+    async fn resolve(&self, query: Message) -> anyhow::Result<DnsResponse> {
+        let mut last_err = None;
+        for _ in 0..2 {
+            let (g, conn) = self.acquire().await?;
+            match conn.resolve(query.clone()).await {
+                Ok(resp) => return Ok(resp),
+                Err(err) => {
+                    self.invalidate(g).await;
+                    last_err = Some(err);
+                }
+            }
+        }
+        Err(last_err
+            .expect("loop runs at least once")
+            .context(format!("upstream {} failed after reconnect", self.addr)))
     }
 }
 
@@ -1026,6 +1140,95 @@ mod tests {
 
     fn pool_with(resolver: Arc<dyn Resolver>, serve_stale: bool, metrics: Arc<Metrics>) -> Pool {
         Pool::from_parts(resolver, 64, serve_stale, metrics)
+    }
+
+    // --- Upstream reconnection (regression for the DoT-default outage: an idle
+    //     connection closed by the upstream made every later send fail with
+    //     `Busy`, so the upstream SERVFAILed forever instead of redialing). ---
+
+    /// A connection that answers `remaining` queries and then fails every later
+    /// one — exactly how a hickory `Client` behaves once its connection is closed
+    /// (`Busy` / disconnected-stream on every send).
+    struct FlakyConn {
+        remaining: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for FlakyConn {
+        async fn resolve(&self, query: Message) -> anyhow::Result<DnsResponse> {
+            if self.remaining.load(Ordering::SeqCst) == 0 {
+                anyhow::bail!("resource too busy");
+            }
+            self.remaining.fetch_sub(1, Ordering::SeqCst);
+            let question = query.queries().first().unwrap().clone();
+            let mut msg = Message::new();
+            msg.set_message_type(MessageType::Response)
+                .set_op_code(OpCode::Query)
+                .set_response_code(ResponseCode::NoError)
+                .add_query(question);
+            Ok(DnsResponse::from_message(msg).unwrap())
+        }
+    }
+
+    /// Dials a fresh [`FlakyConn`] each time, counting dials so a test can assert
+    /// that a dead connection actually triggered a redial.
+    struct FlakyDialer {
+        dials: AtomicUsize,
+        uses_per_conn: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl Dialer for FlakyDialer {
+        async fn dial(&self) -> anyhow::Result<Arc<dyn Connection>> {
+            self.dials.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(FlakyConn {
+                remaining: AtomicUsize::new(self.uses_per_conn),
+            }))
+        }
+    }
+
+    fn flaky_upstream(uses_per_conn: usize) -> (Upstream, Arc<FlakyDialer>) {
+        let dialer = Arc::new(FlakyDialer {
+            dials: AtomicUsize::new(0),
+            uses_per_conn,
+        });
+        let addr = "[::1]:853".parse().unwrap();
+        (Upstream::with_dialer(addr, dialer.clone()), dialer)
+    }
+
+    #[tokio::test]
+    async fn upstream_redials_after_connection_dies() {
+        // Each connection serves exactly one query before "dying", so every query
+        // after the first must transparently redial and still succeed.
+        let (upstream, dialer) = flaky_upstream(1);
+
+        for i in 0..4 {
+            let resp = upstream.resolve(query_msg("example.com.")).await;
+            assert!(
+                resp.is_ok(),
+                "query {i} should heal via reconnect, got {resp:?}"
+            );
+        }
+        // One initial dial plus three reconnects — not a single permanent failure.
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn upstream_gives_up_after_one_reconnect_when_dead() {
+        // A connection that fails immediately and stays dead: resolve must try
+        // once, redial once, then return an error (not loop forever).
+        let (upstream, dialer) = flaky_upstream(0);
+
+        let resp = upstream.resolve(query_msg("example.com.")).await;
+        assert!(
+            resp.is_err(),
+            "a permanently dead upstream must surface an error"
+        );
+        assert_eq!(
+            dialer.dials.load(Ordering::SeqCst),
+            2,
+            "exactly one redial attempt before giving up"
+        );
     }
 
     /// Seed a cache entry whose `fetched_at` is `age_secs` in the past, so it is
