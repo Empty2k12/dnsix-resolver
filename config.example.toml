@@ -27,7 +27,21 @@ metrics_listen = "[::]:9153"
 # Upstream resolvers, tried in order with failover. The listener is IPv6-only,
 # but upstreams may be IPv4 or IPv6 — use whatever the host can reach. On an
 # IPv6-only host (the usual DNS64 deployment) these must be IPv6.
-upstreams = ["[2606:4700:4700::1111]:53", "[2001:4860:4860::8888]:53"]
+#
+# Each entry is either:
+#   * plain Do53 — a bare "[ip]:port" string (UDP, with TCP fallback on truncation), or
+#   * DNS-over-TLS (RFC 7858) — a table { addr = "[ip]:853", dns_name = "..." },
+#     where dns_name is validated against the upstream's TLS certificate (and sent
+#     as SNI). Roots come from a bundled store, so it works on a host with no
+#     system trust store. Port 853 is the DoT default.
+#
+# Defaults to DoT against Cloudflare then Quad9 (secure, malware-filtering). DoT
+# costs a TLS handshake per connection over plain Do53; on a fully trusted path
+# you can drop to the bare-string form for the lowest latency.
+upstreams = [
+  { addr = "[2606:4700:4700::1111]:853", dns_name = "cloudflare-dns.com" },
+  { addr = "[2620:fe::fe]:853", dns_name = "dns.quad9.net" },
+]
 
 # Enabled Synthesizers, in chain order (first to produce records wins). Config
 # order IS precedence: a specific Provider must precede the generic one it would

@@ -45,12 +45,14 @@ use hickory_client::client::Client;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{RData, Record};
 use hickory_proto::runtime::TokioRuntimeProvider;
+use hickory_proto::rustls::{client_config, tls_client_connect};
 use hickory_proto::tcp::TcpClientStream;
 use hickory_proto::udp::UdpClientStream;
 use hickory_proto::xfer::{DnsHandle, DnsResponse};
 use moka::{sync::Cache, Expiry};
 use tokio::task::JoinHandle;
 
+use crate::config::Upstream as UpstreamConfig;
 use crate::metrics::Metrics;
 
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
@@ -81,15 +83,30 @@ const STALE_MAX_WINDOW: Duration = Duration::from_secs(86_400);
 /// same last-10% heuristic).
 const PREFETCH_FRACTION: f64 = 0.10;
 
-/// A single upstream resolver reachable over both UDP and TCP.
-struct Upstream {
-    addr: SocketAddr,
-    udp: Client,
-    tcp: Client,
+/// A single upstream resolver. `Plain` keeps a long-lived UDP and TCP client and
+/// uses UDP with a TCP fallback on truncation; `Tls` (DNS-over-TLS, RFC 7858)
+/// keeps a single TLS-over-TCP client — TLS rides TCP, so it never truncates.
+enum Upstream {
+    Plain {
+        addr: SocketAddr,
+        udp: Client,
+        tcp: Client,
+    },
+    Tls {
+        addr: SocketAddr,
+        client: Client,
+    },
 }
 
 impl Upstream {
-    async fn connect(addr: SocketAddr) -> anyhow::Result<Self> {
+    async fn connect(cfg: &UpstreamConfig) -> anyhow::Result<Self> {
+        match cfg {
+            UpstreamConfig::Plain(addr) => Self::connect_plain(*addr).await,
+            UpstreamConfig::Tls { addr, dns_name } => Self::connect_tls(*addr, dns_name).await,
+        }
+    }
+
+    async fn connect_plain(addr: SocketAddr) -> anyhow::Result<Self> {
         let provider = TokioRuntimeProvider::new();
 
         // UDP: the stream is itself a DnsRequestSender, so Client::connect drives it.
@@ -109,20 +126,55 @@ impl Upstream {
             .with_context(|| format!("connecting TCP client to upstream {addr}"))?;
         tokio::spawn(tcp_bg);
 
-        Ok(Self { addr, udp, tcp })
+        Ok(Self::Plain { addr, udp, tcp })
     }
 
-    /// Send `query` over UDP, retrying over TCP if the answer is truncated.
-    async fn resolve(&self, query: Message) -> anyhow::Result<DnsResponse> {
-        let resp = send_once(&self.udp, query.clone())
+    /// Connect a DNS-over-TLS (RFC 7858) upstream. `dns_name` is validated against
+    /// the server certificate and sent as SNI; roots come from the bundled
+    /// webpki-roots store, so trust is independent of the host's system store. The
+    /// TLS stream plugs into `Client::new` exactly like the plain TCP path.
+    async fn connect_tls(addr: SocketAddr, dns_name: &str) -> anyhow::Result<Self> {
+        let provider = TokioRuntimeProvider::new();
+        let (tls_future, tls_handle) = tls_client_connect(
+            addr,
+            dns_name.to_string(),
+            Arc::new(client_config()),
+            provider,
+        );
+        let (client, bg) = Client::new(tls_future, tls_handle, None)
             .await
-            .with_context(|| format!("UDP query to upstream {}", self.addr))?;
-        if resp.truncated() {
-            send_once(&self.tcp, query)
+            .with_context(|| format!("connecting DoT client to upstream {addr} ({dns_name})"))?;
+        tokio::spawn(bg);
+
+        Ok(Self::Tls { addr, client })
+    }
+
+    /// The socket address of this upstream, for logging.
+    fn addr(&self) -> SocketAddr {
+        match self {
+            Upstream::Plain { addr, .. } | Upstream::Tls { addr, .. } => *addr,
+        }
+    }
+
+    /// Resolve `query`: over UDP with a TCP retry on truncation for a plain
+    /// upstream, or over the single TLS client for a DoT upstream.
+    async fn resolve(&self, query: Message) -> anyhow::Result<DnsResponse> {
+        match self {
+            Upstream::Plain { addr, udp, tcp } => {
+                let resp = send_once(udp, query.clone())
+                    .await
+                    .with_context(|| format!("UDP query to upstream {addr}"))?;
+                if resp.truncated() {
+                    send_once(tcp, query)
+                        .await
+                        .with_context(|| format!("TCP retry to upstream {addr}"))
+                } else {
+                    Ok(resp)
+                }
+            }
+            Upstream::Tls { addr, client } => send_once(client, query)
                 .await
-                .with_context(|| format!("TCP retry to upstream {}", self.addr))
-        } else {
-            Ok(resp)
+                .with_context(|| format!("DoT query to upstream {addr}")),
         }
     }
 }
@@ -157,11 +209,11 @@ impl Resolver for UpstreamSet {
         for upstream in &self.upstreams {
             match upstream.resolve(query.clone()).await {
                 Ok(resp) if resp.response_code() == ResponseCode::ServFail => {
-                    tracing::warn!(upstream = %upstream.addr, "upstream returned SERVFAIL, failing over");
+                    tracing::warn!(upstream = %upstream.addr(), "upstream returned SERVFAIL, failing over");
                 }
                 Ok(resp) => return Some(resp),
                 Err(err) => {
-                    tracing::warn!(upstream = %upstream.addr, error = %format!("{err:#}"), "upstream query failed, failing over");
+                    tracing::warn!(upstream = %upstream.addr(), error = %format!("{err:#}"), "upstream query failed, failing over");
                 }
             }
         }
@@ -217,14 +269,14 @@ pub struct Pool {
 
 impl Pool {
     pub async fn connect(
-        addrs: &[SocketAddr],
+        configs: &[UpstreamConfig],
         cache_size: usize,
         serve_stale: bool,
         metrics: Arc<Metrics>,
     ) -> anyhow::Result<Self> {
-        let mut upstreams = Vec::with_capacity(addrs.len());
-        for &addr in addrs {
-            upstreams.push(Upstream::connect(addr).await?);
+        let mut upstreams = Vec::with_capacity(configs.len());
+        for cfg in configs {
+            upstreams.push(Upstream::connect(cfg).await?);
         }
         Ok(Self::from_parts(
             Arc::new(UpstreamSet { upstreams }),

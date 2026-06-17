@@ -8,6 +8,20 @@ use serde::Deserialize;
 /// this operator runs.
 pub const WELL_KNOWN_NAT64_PREFIX: Ipv6Addr = Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0, 0);
 
+/// A single upstream resolver. Either plain Do53 (UDP with TCP fallback) given as
+/// a bare `"[ip]:port"` string, or DNS-over-TLS (RFC 7858) given as a table with
+/// the address and the certificate name to validate, e.g.
+/// `{ addr = "[2606:4700:4700::1111]:853", dns_name = "cloudflare-dns.com" }`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum Upstream {
+    /// Plain Do53 over UDP, falling back to TCP on a truncated answer.
+    Plain(SocketAddr),
+    /// DNS-over-TLS: TLS-wrapped TCP, with `dns_name` validated against the
+    /// upstream's certificate (SNI).
+    Tls { addr: SocketAddr, dns_name: String },
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -28,7 +42,9 @@ pub struct Config {
 
     /// Explicit list of upstream resolvers, tried in order with failover. May be
     /// IPv4 or IPv6 — the upstream path is independent of the IPv6-only listener.
-    pub upstreams: Vec<SocketAddr>,
+    /// Each entry is either a plain `"[ip]:port"` (Do53) or a DoT table
+    /// `{ addr = "...", dns_name = "..." }`; see [`Upstream`].
+    pub upstreams: Vec<Upstream>,
 
     /// Maximum number of cached upstream answers, where each cached name+type is
     /// one entry. `0` disables the response cache. The cache is positive-only and
@@ -202,6 +218,31 @@ mod tests {
     fn cache_can_be_disabled() {
         let cfg = Config::from_toml("cache_size = 0\nupstreams = [\"192.0.2.1:53\"]").unwrap();
         assert_eq!(cfg.cache_size, 0);
+    }
+
+    #[test]
+    fn parses_plain_and_dot_upstreams() {
+        let cfg = Config::from_toml(
+            "upstreams = [\
+               \"[2001:4860:4860::8888]:53\", \
+               { addr = \"[2606:4700:4700::1111]:853\", dns_name = \"cloudflare-dns.com\" }\
+             ]",
+        )
+        .unwrap();
+        assert_eq!(cfg.upstreams.len(), 2);
+        match &cfg.upstreams[0] {
+            Upstream::Plain(addr) => {
+                assert_eq!(*addr, "[2001:4860:4860::8888]:53".parse().unwrap())
+            }
+            other => panic!("expected plain upstream, got {other:?}"),
+        }
+        match &cfg.upstreams[1] {
+            Upstream::Tls { addr, dns_name } => {
+                assert_eq!(*addr, "[2606:4700:4700::1111]:853".parse().unwrap());
+                assert_eq!(dns_name, "cloudflare-dns.com");
+            }
+            other => panic!("expected DoT upstream, got {other:?}"),
+        }
     }
 
     #[test]
