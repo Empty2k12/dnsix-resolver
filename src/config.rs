@@ -36,6 +36,15 @@ pub struct Config {
     #[serde(default = "default_cache_size")]
     pub cache_size: usize,
 
+    /// Serve-stale (RFC 8767): when an upstream refresh is slow or failing, answer
+    /// from expired cache rather than failing the query. A stale answer is returned
+    /// only after a short client-response timer (so a healthy upstream still wins),
+    /// carries a brief TTL so it self-corrects, and is served for at most ~1 day
+    /// past expiry. Needs the cache (`cache_size > 0`) to have anything to fall back
+    /// on. Default `true`.
+    #[serde(default = "default_serve_stale")]
+    pub serve_stale: bool,
+
     /// Ordered list of enabled Synthesizers (config order = chain precedence;
     /// `nat64` is just an entry, intended last). Absent = `["nat64"]`, i.e. the
     /// original DNS64-only behaviour.
@@ -77,6 +86,10 @@ fn default_prefix() -> Ipv6Addr {
 
 fn default_cache_size() -> usize {
     4096
+}
+
+fn default_serve_stale() -> bool {
+    true
 }
 
 fn default_synthesizers() -> Vec<String> {
@@ -142,6 +155,16 @@ mod tests {
         assert_eq!(cfg.ttl_cap, None);
         assert_eq!(cfg.upstreams.len(), 1);
         assert_eq!(cfg.cache_size, 4096);
+        assert!(cfg.serve_stale);
+    }
+
+    #[test]
+    fn serve_stale_defaults_on_and_parses() {
+        let cfg = Config::from_toml("upstreams = [\"192.0.2.1:53\"]").unwrap();
+        assert!(cfg.serve_stale);
+
+        let cfg = Config::from_toml("serve_stale = false\nupstreams = [\"192.0.2.1:53\"]").unwrap();
+        assert!(!cfg.serve_stale);
     }
 
     #[test]

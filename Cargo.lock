@@ -230,8 +230,8 @@ dependencies = [
  "futures-util",
  "hickory-client",
  "hickory-proto",
- "hickory-resolver",
  "hickory-server",
+ "moka",
  "serde",
  "socket2 0.5.10",
  "tokio",
@@ -452,24 +452,6 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
-]
-
-[[package]]
-name = "hickory-resolver"
-version = "0.25.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc62a9a99b0bfb44d2ab95a7208ac952d31060efc16241c87eaf36406fecf87a"
-dependencies = [
- "cfg-if",
- "futures-util",
- "hickory-proto",
- "moka",
- "once_cell",
- "parking_lot",
- "rand",
- "smallvec",
- "thiserror",
- "tracing",
 ]
 
 [[package]]

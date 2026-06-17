@@ -76,8 +76,16 @@ async fn main() -> anyhow::Result<()> {
         None => info!("metrics endpoint disabled (set `metrics_listen` to enable)"),
     }
 
-    info!(upstreams = ?cfg.upstreams, prefix = %cfg.nat64_prefix, cache_size = cfg.cache_size, synthesizers = ?cfg.synthesizers, "connecting to upstream resolvers");
-    let pool = Arc::new(Pool::connect(&cfg.upstreams, cfg.cache_size, metrics.clone()).await?);
+    info!(upstreams = ?cfg.upstreams, prefix = %cfg.nat64_prefix, cache_size = cfg.cache_size, serve_stale = cfg.serve_stale, synthesizers = ?cfg.synthesizers, "connecting to upstream resolvers");
+    let pool = Arc::new(
+        Pool::connect(
+            &cfg.upstreams,
+            cfg.cache_size,
+            cfg.serve_stale,
+            metrics.clone(),
+        )
+        .await?,
+    );
     let handler = Dns64Handler::new(pool, chain, metrics);
 
     let mut server = hickory_server::ServerFuture::new(handler);

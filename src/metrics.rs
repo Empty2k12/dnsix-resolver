@@ -75,6 +75,8 @@ struct Counters {
     upstream_failed: AtomicU64,
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
+    served_stale: AtomicU64,
+    prefetches: AtomicU64,
     native_aaaa: AtomicU64,
     nxdomain64: AtomicU64,
     nodata: AtomicU64,
@@ -125,6 +127,12 @@ impl Metrics {
     }
     pub fn inc_cache_miss(&self) {
         self.c.cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_served_stale(&self) {
+        self.c.served_stale.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_prefetch(&self) {
+        self.c.prefetches.fetch_add(1, Ordering::Relaxed);
     }
     pub fn inc_native_aaaa(&self) {
         self.c.native_aaaa.fetch_add(1, Ordering::Relaxed);
@@ -237,6 +245,16 @@ impl Metrics {
                 "dns_cache_misses_total",
                 "Response-cache misses for cacheable queries.",
                 &self.c.cache_misses,
+            ),
+            (
+                "dns_served_stale_total",
+                "Answers served from expired cache (RFC 8767 serve-stale).",
+                &self.c.served_stale,
+            ),
+            (
+                "dns_prefetch_total",
+                "Background refreshes triggered by a cache hit near TTL expiry.",
+                &self.c.prefetches,
             ),
             (
                 "dns64_native_aaaa_total",

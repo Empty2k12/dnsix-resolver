@@ -532,7 +532,7 @@ mod tests {
     /// in these tests is pure (shopify has no reference; nat64 embeds), so the
     /// plan never resolves anything.
     async fn empty_pool() -> Pool {
-        Pool::connect(&[], 0, Arc::new(Metrics::new(&[])))
+        Pool::connect(&[], 0, false, Arc::new(Metrics::new(&[])))
             .await
             .unwrap()
     }
