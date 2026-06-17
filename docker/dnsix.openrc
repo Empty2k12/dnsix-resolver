@@ -5,8 +5,10 @@ description="Rust DNS64 with CDN IPv6 tricks"
 
 command="/usr/local/bin/dnsix"
 command_args="--config /etc/dnsix/config.toml"
-command_background=true
+supervisor="supervise-daemon"
 pidfile="/run/dnsix.pid"
+respawn_delay=3
+respawn_max=0
 output_log="/var/log/dnsix.log"
 error_log="/var/log/dnsix.log"
 
