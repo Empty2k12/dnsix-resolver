@@ -41,7 +41,7 @@ upstreams = ["[2606:4700:4700::1111]:53", "[2001:4860:4860::8888]:53"]
 synthesizers = [
   "shopify", "webflow", "cloudflare",
   "fastly", "akamai", "cloudfront", "s3", "oss", "alicdn",
-  "oracleobjectstorage", "msedge", "edgecast", "limelight",
+  "oracleobjectstorage", "msedge",
   "bunnycdn", "blazingcdn", "gcorecdn", "cachefly", "cdn77",
   "awsglb", "weebly", "sucuri", "netlify", "bearblog",
   "azurewebsites", "wpvip",

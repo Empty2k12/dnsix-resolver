@@ -339,8 +339,6 @@ pub(crate) const KNOWN_IDS: &[&str] = &[
     "alicdn",
     "oracleobjectstorage",
     "msedge",
-    "edgecast",
-    "limelight",
     "bunnycdn",
     "blazingcdn",
     "gcorecdn",

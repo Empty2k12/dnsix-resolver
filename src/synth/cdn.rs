@@ -157,14 +157,6 @@ pub(super) fn make(id: &str) -> Option<Box<dyn Synthesizer>> {
             id: "awsglb",
             rewrite: awsglb_rewrite,
         }),
-        "edgecast" => Box::new(MatchRewrite {
-            id: "edgecast",
-            rewrite: edgecast_rewrite,
-        }),
-        "limelight" => Box::new(MatchRewrite {
-            id: "limelight",
-            rewrite: limelight_rewrite,
-        }),
         "azurewebsites" => Box::new(MatchRewrite {
             id: "azurewebsites",
             rewrite: azure_rewrite,
@@ -339,28 +331,6 @@ fn awsglb_rewrite(name: &Name) -> Option<Name> {
         return name_from_labels(&l);
     }
     l.insert(n - 2, "dualstack".to_string());
-    name_from_labels(&l)
-}
-
-/// Edgecast/Windows (`*.v0cdn.net`): set the leftmost-of-four label to `cs21`.
-fn edgecast_rewrite(name: &Name) -> Option<Name> {
-    let mut l = labels(name);
-    let n = l.len();
-    if n < 4 || l[n - 1] != "net" || l[n - 2] != "v0cdn" {
-        return None;
-    }
-    l[n - 4] = "cs21".to_string();
-    name_from_labels(&l)
-}
-
-/// Limelight (`*.llnwi.net`): set the leftmost-of-four label to `msftstore`.
-fn limelight_rewrite(name: &Name) -> Option<Name> {
-    let mut l = labels(name);
-    let n = l.len();
-    if n < 4 || l[n - 1] != "net" || l[n - 2] != "llnwi" {
-        return None;
-    }
-    l[n - 4] = "msftstore".to_string();
     name_from_labels(&l)
 }
 
@@ -1104,15 +1074,7 @@ mod tests {
     }
 
     #[test]
-    fn edgecast_limelight_azure() {
-        assert_eq!(
-            rw(edgecast_rewrite, "foo.bar.v0cdn.net").unwrap(),
-            "cs21.bar.v0cdn.net"
-        );
-        assert_eq!(
-            rw(limelight_rewrite, "a.b.llnwi.net").unwrap(),
-            "msftstore.b.llnwi.net"
-        );
+    fn azure() {
         assert_eq!(
             rw(azure_rewrite, "site.azurewebsites.windows.net").unwrap(),
             "sip-v4andv6.azurewebsites.windows.net"
