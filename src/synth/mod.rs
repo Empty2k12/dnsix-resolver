@@ -195,18 +195,30 @@ impl Chain {
             if let Some(mut records) = self.run_plan(&plan, &a_addrs, ctx, pool).await {
                 metrics.synth_hit(synth.id());
                 tracing::debug!(name = %ctx.name, synthesizer = synth.id(), "synthesized AAAA");
-                // NAT64 fallback: when a CDN Provider won, also append the
-                // NAT64-embedded address (Provider's CDN-native records stay
-                // first). Skipped when `nat64` itself won — it would just
-                // re-emit the same records. The client's RFC 6724 / Happy
-                // Eyeballs logic prefers the native address and falls back to the
-                // NAT64 one only if native won't connect.
+                // NAT64 fallback: when a CDN Provider won, also append a single
+                // NAT64-embedded address as a last-resort candidate (Provider's
+                // CDN-native records stay first). Skipped when `nat64` itself
+                // won — it would just re-emit the same records.
+                //
+                // We can't force the client to try native first: RFC 8305
+                // clients discard our record order and re-sort via RFC 6724,
+                // where 64:ff9b::/96 shares native GUA's precedence (40) and
+                // label (1), so the tie falls to Rule 9 (longest-prefix match) —
+                // native-first is likely but not guaranteed. To make it
+                // deterministic, add a host RFC 6724 policy-table row demoting
+                // 64:ff9b::/96 (deployment note, not something we control here).
+                //
+                // Emit at most one NAT64 AAAA: every eligible A maps to the same
+                // /96, so more than one only bloats the Happy Eyeballs candidate
+                // list without adding a distinct path.
                 if synth.id() != "nat64" {
                     if let Some(nat64) = &self.nat64_fallback {
                         if let Some(plan) = nat64.detect(ctx) {
                             if let Some(extra) = self.run_plan(&plan, &a_addrs, ctx, pool).await {
-                                tracing::debug!(name = %ctx.name, "appended NAT64 fallback AAAA");
-                                records.extend(extra);
+                                if let Some(one) = extra.into_iter().next() {
+                                    tracing::debug!(name = %ctx.name, "appended NAT64 fallback AAAA");
+                                    records.push(one);
+                                }
                             }
                         }
                     }
