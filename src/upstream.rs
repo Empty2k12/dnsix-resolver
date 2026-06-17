@@ -7,8 +7,8 @@
 //!
 //! In front of the upstreams sits an optional response cache ([`StaleCache`]),
 //! which stores positive answers whole (the full answer section, keyed by the
-//! single query) rather than per-record. On top of plain caching it implements
-//! two resilience features:
+//! single query) rather than per-record, and also caches negative answers
+//! (RFC 2308). On top of plain caching it implements two resilience features:
 //!
 //! * **Serve-stale (RFC 8767):** an expired entry is kept for up to ~1 day past
 //!   its TTL. When one is hit we kick off an async refresh and start a short
@@ -24,9 +24,15 @@
 //! Both background refreshes share an in-flight guard keyed by the query, so a
 //! burst of requests for the same name spawns at most one upstream refresh.
 //!
-//! The cache is deliberately narrow: positive answers only, and only for queries
-//! with the DNSSEC-OK (DO) bit clear, so DNSSEC-aware clients always get an
-//! untouched, full-fidelity upstream response.
+//! Negative caching (RFC 2308) stores NXDOMAIN and NODATA responses keyed the
+//! same way, with a TTL of `min(SOA TTL, SOA MINIMUM)` taken from the authority
+//! section; a negative response that carries no SOA is not cached. This blunts
+//! the flood of doomed lookups (Chrome's random-label probes, ad/tracker noise)
+//! that would otherwise hit upstream on every repeat.
+//!
+//! The cache is deliberately narrow: only queries with the DNSSEC-OK (DO) bit
+//! clear are cached, so DNSSEC-aware clients always get an untouched,
+//! full-fidelity upstream response.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -37,7 +43,7 @@ use anyhow::Context;
 use futures_util::stream::StreamExt;
 use hickory_client::client::Client;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::Record;
+use hickory_proto::rr::{RData, Record};
 use hickory_proto::runtime::TokioRuntimeProvider;
 use hickory_proto::tcp::TcpClientStream;
 use hickory_proto::udp::UdpClientStream;
@@ -52,6 +58,11 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
 /// Upper bound a cached TTL is clamped to (one day), matching common forwarder
 /// behaviour and RFC 2181 §8 guidance that implementations may cap received TTLs.
 const MAX_TTL: u32 = 86_400;
+
+/// Upper bound on a negative-cache TTL. RFC 2308 §5 caps negative answers well
+/// below positive ones; one hour keeps a name that starts existing from being
+/// denied for too long while still absorbing repeated doomed lookups.
+const NEG_MAX_TTL: u32 = 3_600;
 
 /// RFC 8767 client-response timer: once a refresh of an expired entry has not
 /// returned within this window we answer with the stale data. Kept just under the
@@ -262,10 +273,14 @@ impl Pool {
 
         if let (Some(cache), Some(question)) = (&inner.cache, &key) {
             match cache.get(question, Instant::now()) {
-                Some(CacheLookup::Fresh { records, prefetch }) => {
-                    if let Some(resp) = build_cached_response(question, records) {
-                        tracing::debug!(name = %question.name(), qtype = %question.query_type(), "cache hit");
+                Some(CacheLookup::Fresh { response, prefetch }) => {
+                    let negative = response.negative;
+                    if let Some(resp) = build_cached_response(question, response) {
+                        tracing::debug!(name = %question.name(), qtype = %question.query_type(), negative, "cache hit");
                         inner.metrics.inc_cache_hit();
+                        if negative {
+                            inner.metrics.inc_negative_cache_hit();
+                        }
                         // Popular name nearing expiry: refresh it before it lapses.
                         if prefetch && self.spawn_refresh(query, question.clone()).is_some() {
                             inner.metrics.inc_prefetch();
@@ -273,8 +288,12 @@ impl Pool {
                         return Some(resp);
                     }
                 }
-                Some(CacheLookup::Stale(records)) => {
-                    if let Some(stale) = build_cached_response(question, records) {
+                Some(CacheLookup::Stale(response)) => {
+                    let negative = response.negative;
+                    if let Some(stale) = build_cached_response(question, response) {
+                        if negative {
+                            inner.metrics.inc_negative_cache_hit();
+                        }
                         return Some(self.serve_stale(query, question.clone(), stale).await);
                     }
                 }
@@ -302,11 +321,21 @@ impl Pool {
             }
         };
 
-        // Cache positive answers only. Negative responses (NXDOMAIN/NODATA) flow
-        // upstream every time — we never cache or serve them stale.
+        // Cache positive answers whole, and negative answers (RFC 2308) keyed on
+        // the SOA in the authority section. A negative response with no SOA — or
+        // any other RCODE (SERVFAIL etc.) — is passed through uncached.
         if let (Some(cache), Some(question)) = (&inner.cache, &key) {
-            if resp.response_code() == ResponseCode::NoError && !resp.answers().is_empty() {
-                cache.insert(question.clone(), resp.answers().to_vec(), Instant::now());
+            let rcode = resp.response_code();
+            let now = Instant::now();
+            if rcode == ResponseCode::NoError && !resp.answers().is_empty() {
+                cache.insert(question.clone(), resp.answers().to_vec(), now);
+            } else if rcode == ResponseCode::NXDomain
+                || (rcode == ResponseCode::NoError && resp.answers().is_empty())
+            {
+                let soa = negative_soa(&resp);
+                if !soa.is_empty() {
+                    cache.insert_negative(question.clone(), rcode, soa, now);
+                }
             }
         }
         Some(resp)
@@ -390,28 +419,35 @@ fn cacheable_question(query: &Message) -> Option<Query> {
     }
 }
 
-/// Build a response message carrying `records` as the answer to `question`.
-fn build_cached_response(question: &Query, records: Vec<Record>) -> Option<DnsResponse> {
-    if records.is_empty() {
+/// Rebuild a response message from a cached entry: the answer section for a
+/// positive hit, or the RCODE plus authority SOA for a negative one (RFC 2308).
+/// Returns `None` for an entry that carries neither (which is never stored).
+fn build_cached_response(question: &Query, response: CachedResponse) -> Option<DnsResponse> {
+    if response.answers.is_empty() && response.authority.is_empty() {
         return None;
     }
     let mut message = Message::new();
     message
         .set_message_type(MessageType::Response)
         .set_op_code(OpCode::Query)
-        .set_response_code(ResponseCode::NoError)
+        .set_response_code(response.response_code)
         .set_recursion_available(true)
         .add_query(question.clone())
-        .add_answers(records);
+        .add_answers(response.answers)
+        .add_name_servers(response.authority);
     DnsResponse::from_message(message).ok()
 }
 
 /// A response cache that retains expired answers for a stale window (RFC 8767).
 ///
-/// Answers are stored whole — the entire answer section (including any CNAME
-/// chain, in upstream order) under the single query key — so a hit is served
-/// verbatim with no per-record reassembly. The min TTL across the answer set
-/// (clamped to [`MAX_TTL`]) is the entry's freshness deadline.
+/// Positive answers are stored whole — the entire answer section (including any
+/// CNAME chain, in upstream order) under the single query key — so a hit is
+/// served verbatim with no per-record reassembly. The min TTL across the answer
+/// set (clamped to [`MAX_TTL`]) is the entry's freshness deadline.
+///
+/// Negative answers (RFC 2308) store the response's RCODE and the authority-
+/// section SOA instead, with a freshness deadline of `min(SOA TTL, SOA MINIMUM)`
+/// clamped to [`NEG_MAX_TTL`]. Serve-stale and prefetch apply to both kinds.
 struct StaleCache {
     cache: Cache<Query, Arc<CacheEntry>>,
     /// How long past its deadline an entry may still be served stale.
@@ -419,11 +455,39 @@ struct StaleCache {
 }
 
 struct CacheEntry {
+    /// Positive answer section; empty for a negative entry.
     answers: Vec<Record>,
+    /// Authority SOA proving a negative answer (RFC 2308); empty for a positive.
+    authority: Vec<Record>,
+    /// RCODE to rebuild: `NoError` for a positive answer or a NODATA negative,
+    /// `NXDomain` for a name-error negative.
+    response_code: ResponseCode,
     /// When the entry was stored (used to recover the original TTL for prefetch).
     fetched_at: Instant,
-    /// Freshness deadline: `fetched_at + min(answer TTLs, MAX_TTL)`.
+    /// Freshness deadline: `fetched_at + min(TTLs, cap)`.
     valid_until: Instant,
+}
+
+impl CacheEntry {
+    /// Snapshot the entry as a rebuildable response, stamping every record (answer
+    /// and authority) with `ttl`.
+    fn to_response(&self, ttl: u32) -> CachedResponse {
+        CachedResponse {
+            response_code: self.response_code,
+            negative: self.answers.is_empty(),
+            answers: stamp_ttl(&self.answers, ttl),
+            authority: stamp_ttl(&self.authority, ttl),
+        }
+    }
+}
+
+/// A cache entry rendered back into the pieces needed to rebuild a response.
+struct CachedResponse {
+    response_code: ResponseCode,
+    /// True for a negative (NXDOMAIN/NODATA) entry, for hit accounting.
+    negative: bool,
+    answers: Vec<Record>,
+    authority: Vec<Record>,
 }
 
 /// The outcome of a cache lookup for a present entry.
@@ -431,11 +495,11 @@ enum CacheLookup {
     /// Still within TTL. `prefetch` is set when it has entered the last
     /// [`PREFETCH_FRACTION`] of its life and should be refreshed proactively.
     Fresh {
-        records: Vec<Record>,
+        response: CachedResponse,
         prefetch: bool,
     },
     /// Expired but within the stale window.
-    Stale(Vec<Record>),
+    Stale(CachedResponse),
 }
 
 impl StaleCache {
@@ -450,6 +514,7 @@ impl StaleCache {
         }
     }
 
+    /// Cache a positive answer, with a deadline of `min(answer TTLs, MAX_TTL)`.
     fn insert(&self, question: Query, answers: Vec<Record>, now: Instant) {
         let ttl = answers
             .iter()
@@ -457,15 +522,51 @@ impl StaleCache {
             .min()
             .unwrap_or(0)
             .min(MAX_TTL);
-        let valid_until = now + Duration::from_secs(u64::from(ttl));
-        self.cache.insert(
+        self.store(
             question,
-            Arc::new(CacheEntry {
+            CacheEntry {
                 answers,
+                authority: Vec::new(),
+                response_code: ResponseCode::NoError,
                 fetched_at: now,
-                valid_until,
-            }),
+                valid_until: now + Duration::from_secs(u64::from(ttl)),
+            },
         );
+    }
+
+    /// Cache a negative answer (RFC 2308). `soa` is the authority-section SOA;
+    /// the deadline is `min(SOA TTL, SOA MINIMUM)` over those records, clamped to
+    /// [`NEG_MAX_TTL`]. Callers must not pass an empty `soa`.
+    fn insert_negative(
+        &self,
+        question: Query,
+        response_code: ResponseCode,
+        soa: Vec<Record>,
+        now: Instant,
+    ) {
+        let ttl = soa
+            .iter()
+            .filter_map(|r| match r.data() {
+                RData::SOA(s) => Some(r.ttl().min(s.minimum())),
+                _ => None,
+            })
+            .min()
+            .unwrap_or(0)
+            .min(NEG_MAX_TTL);
+        self.store(
+            question,
+            CacheEntry {
+                answers: Vec::new(),
+                authority: soa,
+                response_code,
+                fetched_at: now,
+                valid_until: now + Duration::from_secs(u64::from(ttl)),
+            },
+        );
+    }
+
+    fn store(&self, question: Query, entry: CacheEntry) {
+        self.cache.insert(question, Arc::new(entry));
     }
 
     fn get(&self, question: &Query, now: Instant) -> Option<CacheLookup> {
@@ -479,18 +580,26 @@ impl StaleCache {
             let prefetch = !total.is_zero()
                 && remaining.as_secs_f64() <= total.as_secs_f64() * PREFETCH_FRACTION;
             Some(CacheLookup::Fresh {
-                records: stamp_ttl(&entry.answers, remaining.as_secs() as u32),
+                response: entry.to_response(remaining.as_secs() as u32),
                 prefetch,
             })
         } else if now <= entry.valid_until + self.stale_window {
-            Some(CacheLookup::Stale(stamp_ttl(
-                &entry.answers,
-                STALE_SERVE_TTL,
-            )))
+            Some(CacheLookup::Stale(entry.to_response(STALE_SERVE_TTL)))
         } else {
             None
         }
     }
+}
+
+/// Extract the authority-section SOA record(s) from a negative response, used as
+/// the RFC 2308 proof and TTL source. Empty when the response carries no SOA, in
+/// which case the negative answer is not cached.
+fn negative_soa(resp: &DnsResponse) -> Vec<Record> {
+    resp.name_servers()
+        .iter()
+        .filter(|r| matches!(r.data(), RData::SOA(_)))
+        .cloned()
+        .collect()
 }
 
 /// Clone `answers`, stamping every record with `ttl` (a single collapsed TTL, as
@@ -543,7 +652,7 @@ mod tests {
 
     use futures_util::future::join_all;
     use hickory_proto::op::{Edns, MessageType, OpCode};
-    use hickory_proto::rr::rdata::A;
+    use hickory_proto::rr::rdata::{A, SOA};
     use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 
     use crate::metrics::Metrics;
@@ -560,6 +669,14 @@ mod tests {
             ttl,
             RData::A(A(Ipv4Addr::from(ip))),
         )
+    }
+
+    /// An SOA record at `zone` with the given record TTL and MINIMUM field, as a
+    /// negative answer's authority section would carry.
+    fn soa_record(zone: &str, ttl: u32, minimum: u32) -> Record {
+        let name = Name::from_str(zone).unwrap();
+        let soa = SOA::new(name.clone(), name.clone(), 1, 3600, 600, 86400, minimum);
+        Record::from_rdata(name, ttl, RData::SOA(soa))
     }
 
     fn first_ip(records: &[Record]) -> Ipv4Addr {
@@ -581,8 +698,8 @@ mod tests {
         );
 
         match cache.get(&q, now) {
-            Some(CacheLookup::Fresh { records, prefetch }) => {
-                assert_eq!(first_ip(&records), Ipv4Addr::new(93, 1, 2, 3));
+            Some(CacheLookup::Fresh { response, prefetch }) => {
+                assert_eq!(first_ip(&response.answers), Ipv4Addr::new(93, 1, 2, 3));
                 assert!(!prefetch, "a just-stored entry is not yet due for prefetch");
             }
             other => panic!("expected a fresh hit, got {:?}", other.is_some()),
@@ -602,11 +719,11 @@ mod tests {
         );
 
         match cache.get(&q, now + Duration::from_secs(100)) {
-            Some(CacheLookup::Fresh { records, .. }) => {
+            Some(CacheLookup::Fresh { response, .. }) => {
                 assert!(
-                    records[0].ttl() <= 200,
+                    response.answers[0].ttl() <= 200,
                     "ttl should have decayed, got {}",
-                    records[0].ttl()
+                    response.answers[0].ttl()
                 );
             }
             _ => panic!("expected a fresh hit"),
@@ -649,10 +766,10 @@ mod tests {
         );
 
         match cache.get(&q, now + Duration::from_secs(10)) {
-            Some(CacheLookup::Stale(records)) => {
-                assert_eq!(first_ip(&records), Ipv4Addr::new(93, 1, 2, 3));
+            Some(CacheLookup::Stale(response)) => {
+                assert_eq!(first_ip(&response.answers), Ipv4Addr::new(93, 1, 2, 3));
                 // Stale answers are stamped with the short self-correcting TTL.
-                assert_eq!(records[0].ttl(), STALE_SERVE_TTL);
+                assert_eq!(response.answers[0].ttl(), STALE_SERVE_TTL);
             }
             _ => panic!("expected a stale hit"),
         }
@@ -690,6 +807,84 @@ mod tests {
             Some(CacheLookup::Fresh { .. })
         ));
         assert!(cache.get(&q, now + Duration::from_secs(10)).is_none());
+    }
+
+    /// A negative entry round-trips with its RCODE and the authority SOA.
+    #[test]
+    fn negative_entry_round_trips_rcode_and_soa() {
+        let cache = StaleCache::new(64, STALE_MAX_WINDOW);
+        let q = a_query("nope.example.com.");
+        let now = Instant::now();
+        cache.insert_negative(
+            q.clone(),
+            ResponseCode::NXDomain,
+            vec![soa_record("example.com.", 300, 60)],
+            now,
+        );
+
+        match cache.get(&q, now) {
+            Some(CacheLookup::Fresh { response, .. }) => {
+                assert!(response.negative);
+                assert!(response.answers.is_empty());
+                assert_eq!(response.response_code, ResponseCode::NXDomain);
+                assert!(matches!(response.authority[0].data(), RData::SOA(_)));
+            }
+            _ => panic!("expected a fresh negative hit"),
+        }
+    }
+
+    /// The negative TTL is `min(SOA TTL, SOA MINIMUM)` (RFC 2308 §5).
+    #[test]
+    fn negative_ttl_is_min_of_soa_ttl_and_minimum() {
+        let cache = StaleCache::new(64, Duration::ZERO);
+        let q = a_query("nope.example.com.");
+        let now = Instant::now();
+        // SOA TTL 300, MINIMUM 60 -> the entry expires after 60s.
+        cache.insert_negative(
+            q.clone(),
+            ResponseCode::NXDomain,
+            vec![soa_record("example.com.", 300, 60)],
+            now,
+        );
+
+        assert!(matches!(
+            cache.get(&q, now + Duration::from_secs(59)),
+            Some(CacheLookup::Fresh { .. })
+        ));
+        assert!(cache.get(&q, now + Duration::from_secs(61)).is_none());
+    }
+
+    /// A negative TTL is clamped to [`NEG_MAX_TTL`] even when the SOA asks for more.
+    #[test]
+    fn negative_ttl_is_clamped() {
+        let cache = StaleCache::new(64, Duration::ZERO);
+        let q = a_query("nope.example.com.");
+        let now = Instant::now();
+        cache.insert_negative(
+            q.clone(),
+            ResponseCode::NXDomain,
+            vec![soa_record("example.com.", 100_000, 100_000)],
+            now,
+        );
+
+        assert!(cache
+            .get(&q, now + Duration::from_secs(u64::from(NEG_MAX_TTL) + 1))
+            .is_none());
+    }
+
+    /// `negative_soa` returns only the SOA records, and nothing when there is none.
+    #[test]
+    fn negative_soa_extracts_only_soa() {
+        let mut with_soa = Message::new();
+        with_soa.add_name_server(soa_record("example.com.", 300, 60));
+        with_soa.add_name_server(a_record("ns.example.com.", [1, 2, 3, 4], 300));
+        let with_soa = DnsResponse::from_message(with_soa).unwrap();
+        let soa = negative_soa(&with_soa);
+        assert_eq!(soa.len(), 1);
+        assert!(matches!(soa[0].data(), RData::SOA(_)));
+
+        let without = DnsResponse::from_message(Message::new()).unwrap();
+        assert!(negative_soa(&without).is_empty());
     }
 
     fn message_with(queries: &[Query], dnssec_ok: bool) -> Message {
@@ -965,5 +1160,110 @@ mod tests {
         assert_eq!(mock.calls(), 1);
         assert_eq!(counter(&metrics, "dns_prefetch_total"), 1);
         assert_eq!(counter(&metrics, "dns_cache_hits_total"), 1);
+    }
+
+    /// A resolver that always returns a negative response (counting calls),
+    /// optionally carrying an authority SOA.
+    struct NegResolver {
+        calls: AtomicUsize,
+        code: ResponseCode,
+        with_soa: bool,
+    }
+
+    impl NegResolver {
+        fn new(code: ResponseCode, with_soa: bool) -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+                code,
+                with_soa,
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Resolver for NegResolver {
+        async fn resolve(&self, query: Message) -> Option<DnsResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let question = query.queries().first()?.clone();
+            let mut msg = Message::new();
+            msg.set_message_type(MessageType::Response)
+                .set_op_code(OpCode::Query)
+                .set_response_code(self.code)
+                .add_query(question);
+            if self.with_soa {
+                msg.add_name_server(soa_record("example.com.", 300, 60));
+            }
+            DnsResponse::from_message(msg).ok()
+        }
+    }
+
+    #[tokio::test]
+    async fn caches_nxdomain_with_soa() {
+        let metrics = Arc::new(Metrics::new(&[]));
+        let mock = NegResolver::new(ResponseCode::NXDomain, true);
+        let pool = pool_with(mock.clone(), true, metrics.clone());
+
+        let r1 = pool
+            .resolve(query_msg("nope.example.com."))
+            .await
+            .expect("answer");
+        assert_eq!(r1.response_code(), ResponseCode::NXDomain);
+
+        let r2 = pool
+            .resolve(query_msg("nope.example.com."))
+            .await
+            .expect("answer");
+        assert_eq!(r2.response_code(), ResponseCode::NXDomain);
+        // The cached negative carries its proof of non-existence.
+        assert!(r2
+            .name_servers()
+            .iter()
+            .any(|r| matches!(r.data(), RData::SOA(_))));
+
+        assert_eq!(mock.calls(), 1, "the second query is served from cache");
+        assert_eq!(counter(&metrics, "dns_negative_cache_hits_total"), 1);
+        assert_eq!(counter(&metrics, "dns_cache_hits_total"), 1);
+    }
+
+    #[tokio::test]
+    async fn caches_nodata_with_soa() {
+        let metrics = Arc::new(Metrics::new(&[]));
+        // NODATA: NoError with no answers, but an authority SOA.
+        let mock = NegResolver::new(ResponseCode::NoError, true);
+        let pool = pool_with(mock.clone(), true, metrics.clone());
+
+        for _ in 0..2 {
+            let r = pool
+                .resolve(query_msg("nodata.example.com."))
+                .await
+                .expect("answer");
+            assert_eq!(r.response_code(), ResponseCode::NoError);
+            assert!(r.answers().is_empty());
+        }
+        assert_eq!(mock.calls(), 1, "NODATA is cached and re-served");
+        assert_eq!(counter(&metrics, "dns_negative_cache_hits_total"), 1);
+    }
+
+    #[tokio::test]
+    async fn negative_without_soa_is_not_cached() {
+        let metrics = Arc::new(Metrics::new(&[]));
+        let mock = NegResolver::new(ResponseCode::NXDomain, false);
+        let pool = pool_with(mock.clone(), true, metrics.clone());
+
+        for _ in 0..2 {
+            pool.resolve(query_msg("nope.example.com."))
+                .await
+                .expect("answer");
+        }
+        assert_eq!(
+            mock.calls(),
+            2,
+            "with no SOA there is nothing to cache, so both queries hit upstream"
+        );
+        assert_eq!(counter(&metrics, "dns_negative_cache_hits_total"), 0);
     }
 }

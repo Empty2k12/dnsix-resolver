@@ -75,6 +75,7 @@ struct Counters {
     upstream_failed: AtomicU64,
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
+    negative_cache_hits: AtomicU64,
     served_stale: AtomicU64,
     prefetches: AtomicU64,
     native_aaaa: AtomicU64,
@@ -127,6 +128,9 @@ impl Metrics {
     }
     pub fn inc_cache_miss(&self) {
         self.c.cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_negative_cache_hit(&self) {
+        self.c.negative_cache_hits.fetch_add(1, Ordering::Relaxed);
     }
     pub fn inc_served_stale(&self) {
         self.c.served_stale.fetch_add(1, Ordering::Relaxed);
@@ -245,6 +249,11 @@ impl Metrics {
                 "dns_cache_misses_total",
                 "Response-cache misses for cacheable queries.",
                 &self.c.cache_misses,
+            ),
+            (
+                "dns_negative_cache_hits_total",
+                "Cache hits served from a negative (NXDOMAIN/NODATA) entry (RFC 2308).",
+                &self.c.negative_cache_hits,
             ),
             (
                 "dns_served_stale_total",
