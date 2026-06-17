@@ -63,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
         &cfg.synthesizers,
         cfg.nat64_prefix,
         cfg.ttl_cap,
+        cfg.nat64_fallback,
     )?);
     let metrics = Arc::new(Metrics::new(&cfg.synthesizers));
 

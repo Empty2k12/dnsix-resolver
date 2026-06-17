@@ -130,6 +130,11 @@ pub trait Synthesizer: Send + Sync {
 pub struct Chain {
     synths: Vec<Box<dyn Synthesizer>>,
     ttl_cap: Option<u32>,
+    /// NAT64 fallback synthesizer, present when `nat64_fallback` is enabled *and*
+    /// `nat64` is in the chain (i.e. a translator exists). When a Provider wins,
+    /// this is run too and its embedded address appended after the Provider's, so
+    /// a broken CDN-native edge degrades to reachable-via-translator.
+    nat64_fallback: Option<nat64::Nat64>,
 }
 
 impl Chain {
@@ -139,6 +144,7 @@ impl Chain {
         ids: &[String],
         nat64_prefix: Ipv6Addr,
         ttl_cap: Option<u32>,
+        nat64_fallback: bool,
     ) -> anyhow::Result<Self> {
         validate_order(ids)?;
 
@@ -153,7 +159,24 @@ impl Chain {
             }
         }
 
-        Ok(Chain { synths, ttl_cap })
+        // Fallback only makes sense when the operator actually runs NAT64 (i.e.
+        // `nat64` is in the chain): injecting `64:ff9b::` addresses on a network
+        // with no translator would be harmful, not helpful.
+        let nat64_in_chain = ids.iter().any(|id| id == "nat64");
+        if nat64_fallback && !nat64_in_chain {
+            tracing::warn!(
+                "nat64_fallback is enabled but \"nat64\" is not among the synthesizers; \
+                 fallback is disabled (no translator to fall back to)"
+            );
+        }
+        let nat64_fallback =
+            (nat64_fallback && nat64_in_chain).then(|| nat64::Nat64::new(nat64_prefix));
+
+        Ok(Chain {
+            synths,
+            ttl_cap,
+            nat64_fallback,
+        })
     }
 
     /// Synthesize AAAA records for an AAAA-NODATA name, or `None` if no
@@ -169,9 +192,25 @@ impl Chain {
             let Some(plan) = synth.detect(ctx) else {
                 continue;
             };
-            if let Some(records) = self.run_plan(&plan, &a_addrs, ctx, pool).await {
+            if let Some(mut records) = self.run_plan(&plan, &a_addrs, ctx, pool).await {
                 metrics.synth_hit(synth.id());
                 tracing::debug!(name = %ctx.name, synthesizer = synth.id(), "synthesized AAAA");
+                // NAT64 fallback: when a CDN Provider won, also append the
+                // NAT64-embedded address (Provider's CDN-native records stay
+                // first). Skipped when `nat64` itself won — it would just
+                // re-emit the same records. The client's RFC 6724 / Happy
+                // Eyeballs logic prefers the native address and falls back to the
+                // NAT64 one only if native won't connect.
+                if synth.id() != "nat64" {
+                    if let Some(nat64) = &self.nat64_fallback {
+                        if let Some(plan) = nat64.detect(ctx) {
+                            if let Some(extra) = self.run_plan(&plan, &a_addrs, ctx, pool).await {
+                                tracing::debug!(name = %ctx.name, "appended NAT64 fallback AAAA");
+                                records.extend(extra);
+                            }
+                        }
+                    }
+                }
                 return Some(records);
             }
         }
@@ -473,5 +512,110 @@ mod tests {
         assert!(!is_global_unicast_v6("fe80::1".parse().unwrap()));
         assert!(!is_global_unicast_v6("fc00::1".parse().unwrap()));
         assert!(!is_global_unicast_v6("ff02::1".parse().unwrap()));
+    }
+
+    // --- NAT64 fallback (dual-answer, ADR 0005) -----------------------------
+
+    use std::sync::Arc;
+
+    /// A pool with no upstreams — fine here because every Synthesizer exercised
+    /// in these tests is pure (shopify has no reference; nat64 embeds), so the
+    /// plan never resolves anything.
+    async fn empty_pool() -> Pool {
+        Pool::connect(&[], 0, Arc::new(Metrics::new(&[])))
+            .await
+            .unwrap()
+    }
+
+    fn ctx_with_a(name: &str, ip: Ipv4Addr) -> SynthContext {
+        SynthContext::new(n(name), vec![], vec![(ip, 300)], Default::default())
+    }
+
+    fn aaaa_addrs(records: &[Record]) -> Vec<Ipv6Addr> {
+        records
+            .iter()
+            .filter_map(|r| match r.data() {
+                RData::AAAA(a) => Some(a.0),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn wk_prefix() -> Ipv6Addr {
+        "64:ff9b::".parse().unwrap()
+    }
+
+    // An A in Shopify's range, so the shopify Provider matches on IP. Shopify's
+    // constant is 2620:127:f00f::; the NAT64 embedding of 23.227.38.10 is
+    // 64:ff9b::17e3:260a.
+    fn shopify_ctx() -> SynthContext {
+        ctx_with_a("shop.example.com.", Ipv4Addr::new(23, 227, 38, 10))
+    }
+
+    #[tokio::test]
+    async fn nat64_fallback_appended_after_provider() {
+        let chain =
+            Chain::build(&["shopify".into(), "nat64".into()], wk_prefix(), None, true).unwrap();
+        let records = chain
+            .synthesize(&shopify_ctx(), &empty_pool().await, &Metrics::new(&[]))
+            .await
+            .expect("shopify matches");
+        // CDN-native first, NAT64 fallback appended after.
+        assert_eq!(
+            aaaa_addrs(&records),
+            vec![
+                "2620:127:f00f::".parse::<Ipv6Addr>().unwrap(),
+                "64:ff9b::17e3:260a".parse::<Ipv6Addr>().unwrap(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn no_fallback_when_disabled() {
+        let chain = Chain::build(
+            &["shopify".into(), "nat64".into()],
+            wk_prefix(),
+            None,
+            false, // nat64_fallback off
+        )
+        .unwrap();
+        let records = chain
+            .synthesize(&shopify_ctx(), &empty_pool().await, &Metrics::new(&[]))
+            .await
+            .expect("shopify matches");
+        assert_eq!(
+            aaaa_addrs(&records),
+            vec!["2620:127:f00f::".parse::<Ipv6Addr>().unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn no_fallback_without_nat64_in_chain() {
+        // Fallback requested but no translator (nat64 absent) — disabled, no panic.
+        let chain = Chain::build(&["shopify".into()], wk_prefix(), None, true).unwrap();
+        let records = chain
+            .synthesize(&shopify_ctx(), &empty_pool().await, &Metrics::new(&[]))
+            .await
+            .expect("shopify matches");
+        assert_eq!(
+            aaaa_addrs(&records),
+            vec!["2620:127:f00f::".parse::<Ipv6Addr>().unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn nat64_winner_not_doubled() {
+        // No Provider matches; nat64 wins directly and must not be appended twice.
+        let chain =
+            Chain::build(&["shopify".into(), "nat64".into()], wk_prefix(), None, true).unwrap();
+        let ctx = ctx_with_a("plain.example.com.", Ipv4Addr::new(93, 184, 216, 34));
+        let records = chain
+            .synthesize(&ctx, &empty_pool().await, &Metrics::new(&[]))
+            .await
+            .expect("nat64 matches");
+        assert_eq!(
+            aaaa_addrs(&records),
+            vec!["64:ff9b::5db8:d822".parse::<Ipv6Addr>().unwrap()]
+        );
     }
 }

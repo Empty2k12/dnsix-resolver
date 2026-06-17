@@ -42,6 +42,16 @@ pub struct Config {
     #[serde(default = "default_synthesizers")]
     pub synthesizers: Vec<String>,
 
+    /// When a CDN Provider synthesizes a native-IPv6 AAAA, also append the
+    /// NAT64-embedded address as a fallback (CDN-native ordered first), so a
+    /// broken CDN-native edge degrades to reachable-via-translator: the client's
+    /// RFC 6724 / Happy Eyeballs logic prefers the native address and uses the
+    /// NAT64 one only if native won't connect. Only takes effect when `nat64` is
+    /// among the enabled `synthesizers` (i.e. a NAT64 translator exists);
+    /// otherwise it is a no-op. Default `true`.
+    #[serde(default = "default_nat64_fallback")]
+    pub nat64_fallback: bool,
+
     /// Optional address for the Prometheus metrics endpoint (`GET /metrics`).
     /// Absent = metrics server disabled. On an IPv6-only host use an IPv6 address
     /// (e.g. `[::]:9153`).
@@ -71,6 +81,10 @@ fn default_cache_size() -> usize {
 
 fn default_synthesizers() -> Vec<String> {
     vec!["nat64".to_string()]
+}
+
+fn default_nat64_fallback() -> bool {
+    true
 }
 
 fn default_log() -> String {
@@ -149,6 +163,16 @@ mod tests {
         let cfg =
             Config::from_toml("log = \"dnsix=debug\"\nupstreams = [\"192.0.2.1:53\"]").unwrap();
         assert_eq!(cfg.log, "dnsix=debug");
+    }
+
+    #[test]
+    fn nat64_fallback_defaults_on_and_parses() {
+        let cfg = Config::from_toml("upstreams = [\"192.0.2.1:53\"]").unwrap();
+        assert!(cfg.nat64_fallback);
+
+        let cfg =
+            Config::from_toml("nat64_fallback = false\nupstreams = [\"192.0.2.1:53\"]").unwrap();
+        assert!(!cfg.nat64_fallback);
     }
 
     #[test]
