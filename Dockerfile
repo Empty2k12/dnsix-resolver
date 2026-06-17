@@ -24,6 +24,16 @@ RUN chmod +x /etc/init.d/dnsix \
     && rc-update add syslog boot \
     && rc-update add dnsix default
 
+# Proxmox attaches the LXC console to /dev/console; Alpine's default
+# inittab only spawns gettys on tty1/tty2, so add a console getty to get
+# boot output and a login prompt on the Proxmox console.
+RUN echo 'console::respawn:/sbin/getty -L 38400 console vt100' >> /etc/inittab
+
 EXPOSE 53/udp 53/tcp 9153/tcp
 
-CMD ["/usr/local/bin/dnsix", "--config", "/etc/dnsix/config.toml"]
+# When this image is imported as a Proxmox LXC template the image CMD
+# becomes lxc.init.cmd, so PID 1 must be the init system (which boots
+# OpenRC -> networking + the dnsix service) rather than the application
+# itself. Running dnsix directly as PID 1 skips OpenRC entirely and
+# leaves the console with no getty attached.
+CMD ["/sbin/init"]

@@ -1,7 +1,7 @@
 #!/sbin/openrc-run
 
 name="dnsix"
-description="Rust DNS64 with CDN Ipv& Tricks"
+description="Rust DNS64 with CDN IPv6 tricks"
 
 command="/usr/local/bin/dnsix"
 command_args="--config /etc/dnsix/config.toml"

@@ -101,12 +101,12 @@ impl Dns64Handler {
             })
             .collect();
 
-        let ctx = SynthContext {
-            name: query.name().clone(),
+        let ctx = SynthContext::new(
+            query.name().clone(),
             cname_targets,
             a_records,
-            authority: extract_authority(&aaaa),
-        };
+            extract_authority(&aaaa),
+        );
 
         match self.chain.synthesize(&ctx, &self.pool, &self.metrics).await {
             Some(records) => {
@@ -124,6 +124,10 @@ impl Dns64Handler {
         }
     }
 
+    /// Send a synthesized answer. The AAAA records are emitted directly at the
+    /// queried owner name; any CNAME chain from the upstream AAAA answer is
+    /// deliberately omitted, so the client gets a self-consistent AAAA for the
+    /// name it asked for (the canonical-name indirection is not reproduced).
     async fn send_synthesized<R: ResponseHandler>(
         &self,
         request: &Request,

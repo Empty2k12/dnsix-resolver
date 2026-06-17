@@ -53,11 +53,35 @@ pub struct SynthContext {
     pub a_records: Vec<(Ipv4Addr, u32)>,
     /// Authority-section signals from the AAAA response.
     pub authority: Authority,
+    /// Lowercased labels of each hostname (parallel to [`hostnames`]), derived
+    /// once so the per-provider detection loop doesn't re-split/-allocate them.
+    pub(crate) hostname_labels: Vec<Vec<String>>,
 }
 
 impl SynthContext {
+    /// Build a context, precomputing the hostname label vectors used by suffix
+    /// matching (CNAME targets first — the CDN hostname is usually the chain's
+    /// end — then the queried name).
+    pub fn new(
+        name: Name,
+        cname_targets: Vec<Name>,
+        a_records: Vec<(Ipv4Addr, u32)>,
+        authority: Authority,
+    ) -> Self {
+        let mut hostname_labels: Vec<Vec<String>> = cname_targets.iter().map(labels).collect();
+        hostname_labels.push(labels(&name));
+        Self {
+            name,
+            cname_targets,
+            a_records,
+            authority,
+            hostname_labels,
+        }
+    }
+
     /// Hostnames a Provider may match against, CNAME targets first (the CDN
-    /// hostname is usually the chain's end) then the queried name.
+    /// hostname is usually the chain's end) then the queried name. Order matches
+    /// [`hostname_labels`].
     fn hostnames(&self) -> Vec<&Name> {
         let mut v: Vec<&Name> = self.cname_targets.iter().collect();
         v.push(&self.name);
@@ -244,7 +268,10 @@ pub fn capped_ttl(ttl: u32, cap: Option<u32>) -> u32 {
 
 /// Whether a synthesized address is a sane global unicast IPv6 to serve. Filters
 /// the unspecified/loopback/multicast/link-local/ULA junk a transform might emit.
-fn is_global_unicast_v6(ip: Ipv6Addr) -> bool {
+/// Also used at config time to reject a NAT64 prefix whose embedded addresses
+/// this same filter would later strip (a NAT64 result shares the prefix's first
+/// segment, so the prefix itself is a faithful proxy).
+pub(crate) fn is_global_unicast_v6(ip: Ipv6Addr) -> bool {
     if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
         return false;
     }
@@ -343,9 +370,15 @@ pub(crate) fn labels(name: &Name) -> Vec<String> {
 
 /// Whether `name`'s trailing labels equal `suffix` (already lowercase).
 pub(crate) fn ends_with(name: &Name, suffix: &[&str]) -> bool {
-    let l = labels(name);
-    l.len() >= suffix.len()
-        && l[l.len() - suffix.len()..]
+    labels_end_with(&labels(name), suffix)
+}
+
+/// Whether already-computed `labels` end with `suffix`. Lets callers that hold a
+/// precomputed label vector (see [`SynthContext::hostname_labels`]) match without
+/// re-deriving it.
+pub(crate) fn labels_end_with(labels: &[String], suffix: &[&str]) -> bool {
+    labels.len() >= suffix.len()
+        && labels[labels.len() - suffix.len()..]
             .iter()
             .zip(suffix)
             .all(|(a, b)| a == b)

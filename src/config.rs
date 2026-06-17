@@ -102,6 +102,16 @@ impl Config {
                 self.nat64_prefix
             );
         }
+        // A NAT64-embedded address inherits the prefix's high bits, so a non-global
+        // prefix (loopback/link-local/ULA/multicast) would produce addresses the
+        // synthesis filter strips — yielding silent empty answers. Reject it loudly.
+        if !crate::synth::is_global_unicast_v6(self.nat64_prefix) {
+            anyhow::bail!(
+                "nat64_prefix {} is not globally-routable IPv6; embedded addresses would be \
+                 unservable (synthesis drops loopback/link-local/ULA/multicast)",
+                self.nat64_prefix
+            );
+        }
         Ok(())
     }
 }
@@ -136,7 +146,8 @@ mod tests {
         let cfg = Config::from_toml("upstreams = [\"192.0.2.1:53\"]").unwrap();
         assert_eq!(cfg.log, "off");
 
-        let cfg = Config::from_toml("log = \"dnsix=debug\"\nupstreams = [\"192.0.2.1:53\"]").unwrap();
+        let cfg =
+            Config::from_toml("log = \"dnsix=debug\"\nupstreams = [\"192.0.2.1:53\"]").unwrap();
         assert_eq!(cfg.log, "dnsix=debug");
     }
 
@@ -165,5 +176,14 @@ mod tests {
             Config::from_toml("nat64_prefix = \"64:ff9b::1\"\nupstreams = [\"192.0.2.1:53\"]")
                 .unwrap_err();
         assert!(err.to_string().contains("/96"));
+    }
+
+    #[test]
+    fn rejects_non_global_prefix() {
+        // A ULA /96 prefix is well-formed but its embedded addresses would be
+        // filtered out at synthesis time, so it must be rejected at startup.
+        let err = Config::from_toml("nat64_prefix = \"fd00:64::\"\nupstreams = [\"192.0.2.1:53\"]")
+            .unwrap_err();
+        assert!(err.to_string().contains("globally-routable"));
     }
 }

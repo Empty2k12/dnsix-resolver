@@ -169,12 +169,12 @@ mod tests {
     }
 
     fn ctx(name: &str, addrs: &[Ipv4Addr]) -> SynthContext {
-        SynthContext {
-            name: Name::from_str(name).unwrap(),
-            cname_targets: vec![],
-            a_records: addrs.iter().map(|ip| (*ip, 300)).collect(),
-            authority: Default::default(),
-        }
+        SynthContext::new(
+            Name::from_str(name).unwrap(),
+            vec![],
+            addrs.iter().map(|ip| (*ip, 300)).collect(),
+            Default::default(),
+        )
     }
 
     #[test]

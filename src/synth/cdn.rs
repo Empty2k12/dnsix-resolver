@@ -13,7 +13,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use hickory_proto::rr::Name;
 
-use super::{ends_with, in_any, in_cidr, labels, name_from_labels, parse_name};
+use super::{ends_with, in_any, in_cidr, labels, labels_end_with, name_from_labels, parse_name};
 use super::{Combine, Plan, SynthContext, Synthesizer};
 
 /// Construct a CDN provider by id, or `None` if unknown.
@@ -185,9 +185,9 @@ pub(super) fn make(id: &str) -> Option<Box<dyn Synthesizer>> {
 // ---------------------------------------------------------------------------
 
 fn host_matches(ctx: &SynthContext, suffixes: &[&[&str]]) -> bool {
-    ctx.hostnames()
+    ctx.hostname_labels
         .iter()
-        .any(|h| suffixes.iter().any(|s| ends_with(h, s)))
+        .any(|l| suffixes.iter().any(|s| labels_end_with(l, s)))
 }
 
 fn ip_matches(ctx: &SynthContext, ranges: &[&str]) -> bool {
@@ -514,7 +514,10 @@ fn oss_rewrite(name: &Name) -> Option<Name> {
     if dp2 == 1 {
         s[1] = "aliyuncs".to_string();
     }
-    if !(dp0 == 0 && (dp1 == 1 || dp2 == 1)) {
+    // Need `com` at 0, `aliyuncs`/`aliyun-inc` at 1, and at least one more label
+    // (the body at `s[2]`) — a bare `aliyuncs.com` / `aliyun-inc.com` has none and
+    // would index out of bounds. (s3_rewrite guards the same way via `s.len() > 2`.)
+    if !(dp0 == 0 && (dp1 == 1 || dp2 == 1)) || s.len() <= 2 {
         return None;
     }
 
@@ -1328,6 +1331,11 @@ mod tests {
         for (input, want) in cases {
             assert_eq!(rw(oss_rewrite, input).as_deref(), Some(want), "oss {input}");
         }
+        // Two-label names that satisfy the suffix check but have no body label:
+        // these must be a clean None, not an out-of-bounds panic on `s[2]`.
+        for none in ["aliyuncs.com", "aliyun-inc.com", "www.example.com"] {
+            assert_eq!(rw(oss_rewrite, none), None, "oss none {none}");
+        }
     }
 
     #[test]
@@ -1403,12 +1411,12 @@ mod tests {
     #[test]
     fn wpvip_embed() {
         let s = Wpvip;
-        let ctx = SynthContext {
-            name: Name::from_str("wpvip.com.").unwrap(),
-            cname_targets: vec![],
-            a_records: vec![("192.0.66.5".parse().unwrap(), 300)],
-            authority: Default::default(),
-        };
+        let ctx = SynthContext::new(
+            Name::from_str("wpvip.com.").unwrap(),
+            vec![],
+            vec![("192.0.66.5".parse().unwrap(), 300)],
+            Default::default(),
+        );
         let plan = s.detect(&ctx).unwrap();
         let out = (plan.combine)(&[], &ctx.a_addrs());
         assert_eq!(

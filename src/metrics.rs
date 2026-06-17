@@ -13,6 +13,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::RecordType;
@@ -281,6 +282,11 @@ impl Metrics {
     }
 }
 
+/// How long a single metrics connection may take before we drop it. Bounds the
+/// per-connection task so an idle or slow client can't park a task forever (the
+/// endpoint is unauthenticated, so this guards against trivial slow-loris).
+const CONN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Serve the metrics endpoint forever. Logs and returns if the bind fails (the
 /// rest of the server keeps running — metrics are best-effort).
 pub async fn serve(metrics: Arc<Metrics>, addr: SocketAddr) {
@@ -298,8 +304,12 @@ pub async fn serve(metrics: Arc<Metrics>, addr: SocketAddr) {
             Ok((stream, _peer)) => {
                 let metrics = metrics.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_conn(stream, metrics).await {
-                        tracing::debug!(error = %err, "metrics: connection error");
+                    match tokio::time::timeout(CONN_TIMEOUT, handle_conn(stream, metrics)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            tracing::debug!(error = %err, "metrics: connection error")
+                        }
+                        Err(_) => tracing::debug!("metrics: connection timed out"),
                     }
                 });
             }
