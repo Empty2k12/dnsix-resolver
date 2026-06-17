@@ -20,21 +20,6 @@ use super::{Combine, Plan, SynthContext, Synthesizer};
 pub(super) fn make(id: &str) -> Option<Box<dyn Synthesizer>> {
     Some(match id {
         // --- constant (with optional live reference for the freshness guard) ---
-        "cloudflare" => Box::new(MatchConst {
-            id: "cloudflare",
-            suffixes: &[&["cdn", "cloudflare", "net"]],
-            ranges: &[
-                "104.16.0.0/12",
-                "162.159.128.0/17",
-                "216.198.53.0/24",  // zendesk
-                "216.198.54.0/24",  // zendesk
-                "141.193.213.0/24", // wpengine
-                "94.247.142.0/24",  // servd
-                "103.133.1.0/24",   // laravel cloud
-            ],
-            addr: "2606:4700::6810:bad",
-            reference: Some("www.cloudflare.com"),
-        }),
         "shopify" => Box::new(MatchConst {
             id: "shopify",
             suffixes: &[&["shopify", "com"], &["myshopify", "com"]],
@@ -163,6 +148,7 @@ pub(super) fn make(id: &str) -> Option<Box<dyn Synthesizer>> {
         }),
 
         // --- custom ---
+        "cloudflare" => Box::new(Cloudflare),
         "fastly" => Box::new(Fastly),
         "msedge" => Box::new(Msedge),
         "wpvip" => Box::new(Wpvip),
@@ -806,6 +792,60 @@ impl Synthesizer for Wpvip {
     }
 }
 
+/// Cloudflare: a proxied zone's AAAA is a deterministic embedding of its anycast
+/// IPv4 — `2606:4700::<32-bit IPv4>` (verified: names on `104.16.0.0/12` such as
+/// cloudflare.com/blog/dash/developers serve exactly this form). We synthesize it
+/// only for A records in that HTTP-proxy anycast range, so the result is the zone's
+/// own edge address rather than a generic guess.
+///
+/// IPv6 compatibility is on by default for proxied records, so a proxied zone
+/// normally already has native AAAA and never reaches synthesis; this fires only
+/// for the residual zones that explicitly disabled it. We deliberately do *not*
+/// match on the broad signals the upstream port used — `162.159.128.0/17` (whose
+/// served IPv6 does not embed consistently), the Cloudflare-for-SaaS partner
+/// ranges (zendesk/wpengine/servd/laravel, fronted on a different IPv6 prefix such
+/// as `2a06:98c1::`), or a `cdn.cloudflare.net` hostname — because for those we
+/// cannot derive the correct edge. A name merely DNS-hosted by Cloudflare (origin
+/// A outside the range) likewise no longer matches. All of these fall through to
+/// the NAT64 fallback, which reaches the working IPv4 edge via the translator
+/// rather than being handed a possibly-unreachable Cloudflare anycast address.
+struct Cloudflare;
+
+/// Cloudflare's HTTP reverse-proxy anycast IPv4 range whose `2606:4700::<ipv4>`
+/// IPv6 embedding is verified servable.
+const CLOUDFLARE_RANGE: &str = "104.16.0.0/12";
+
+fn cloudflare_v4to6(ip: Ipv4Addr) -> Option<Ipv6Addr> {
+    let o = ip.octets();
+    format!(
+        "2606:4700::{:02x}{:02x}:{:02x}{:02x}",
+        o[0], o[1], o[2], o[3]
+    )
+    .parse()
+    .ok()
+}
+
+impl Synthesizer for Cloudflare {
+    fn id(&self) -> &'static str {
+        "cloudflare"
+    }
+    fn detect(&self, ctx: &SynthContext) -> Option<Plan> {
+        if !ctx
+            .a_records
+            .iter()
+            .any(|(ip, _)| in_cidr(*ip, CLOUDFLARE_RANGE))
+        {
+            return None;
+        }
+        Some(Plan::pure(Box::new(|_, v4| {
+            v4.iter()
+                .filter(|ip| in_cidr(**ip, CLOUDFLARE_RANGE))
+                .filter_map(|ip| cloudflare_v4to6(*ip))
+                .collect()
+        })))
+    }
+}
+
 /// CacheFly: hostname path rewrites to a `-dstack` variant and resolves it; the
 /// IP path embeds the A address into `2605:4c40::/32`.
 struct Cachefly;
@@ -1368,6 +1408,45 @@ mod tests {
             fastly_fuse(p, 396).unwrap(),
             "2a04:4e42::396".parse::<Ipv6Addr>().unwrap()
         );
+    }
+
+    #[test]
+    fn cloudflare_embed() {
+        // 104.16.132.229 -> 0x68 0x10 0x84 0xe5 -> 2606:4700::6810:84e5
+        // (the AAAA cloudflare.com actually serves for that A).
+        assert_eq!(
+            cloudflare_v4to6("104.16.132.229".parse().unwrap()).unwrap(),
+            "2606:4700::6810:84e5".parse::<Ipv6Addr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn cloudflare_matches_only_proxy_range() {
+        let s = Cloudflare;
+        // A in 104.16.0.0/12: embed the address.
+        let ctx = SynthContext::new(
+            Name::from_str("proxied.example.com.").unwrap(),
+            vec![],
+            vec![("104.16.132.229".parse().unwrap(), 300)],
+            Default::default(),
+        );
+        let plan = s.detect(&ctx).expect("matches proxy range");
+        assert_eq!(
+            (plan.combine)(&[], &ctx.a_addrs()),
+            vec!["2606:4700::6810:84e5".parse::<Ipv6Addr>().unwrap()]
+        );
+
+        // A outside the proxy range (e.g. a merely DNS-hosted origin, a SaaS
+        // partner range, or 162.159) no longer matches -> NAT64 fallback handles it.
+        for ip in ["203.0.113.5", "162.159.140.10", "216.198.53.7"] {
+            let ctx = SynthContext::new(
+                Name::from_str("x.example.com.").unwrap(),
+                vec![],
+                vec![(ip.parse().unwrap(), 300)],
+                Default::default(),
+            );
+            assert!(s.detect(&ctx).is_none(), "should not match {ip}");
+        }
     }
 
     #[test]
