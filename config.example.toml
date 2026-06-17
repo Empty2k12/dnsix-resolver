@@ -22,7 +22,7 @@ cache_size = 4096
 # Omit to disable the endpoint. On an IPv6-only host use an IPv6 address. The
 # endpoint is unauthenticated, so bind loopback ("[::1]:9153") or keep it behind a
 # trusted network.
-# metrics_listen = "[::]:9153"
+metrics_listen = "[::]:9153"
 
 # Upstream resolvers, tried in order with failover. The listener is IPv6-only,
 # but upstreams may be IPv4 or IPv6 — use whatever the host can reach. On an
@@ -38,15 +38,15 @@ upstreams = ["[2606:4700:4700::1111]:53", "[2001:4860:4860::8888]:53"]
 #
 # CDN Providers point at real native CDN IPv6 (no NAT64 translator hop)
 #
-# synthesizers = [
-#   "shopify", "webflow", "cloudflare",
-#   "fastly", "akamai", "cloudfront", "s3", "oss", "alicdn",
-#   "oracleobjectstorage", "msedge", "edgecast", "limelight",
-#   "bunnycdn", "blazingcdn", "gcorecdn", "cachefly", "cdn77",
-#   "awsglb", "weebly", "sucuri", "netlify", "bearblog",
-#   "azurewebsites", "wpvip",
-#   "nat64",
-# ]
+synthesizers = [
+  "shopify", "webflow", "cloudflare",
+  "fastly", "akamai", "cloudfront", "s3", "oss", "alicdn",
+  "oracleobjectstorage", "msedge", "edgecast", "limelight",
+  "bunnycdn", "blazingcdn", "gcorecdn", "cachefly", "cdn77",
+  "awsglb", "weebly", "sucuri", "netlify", "bearblog",
+  "azurewebsites", "wpvip",
+  "nat64",
+]
 
 # When a CDN Provider synthesizes a native-IPv6 AAAA, also append the NAT64-
 # embedded address (CDN-native ordered first), so a broken CDN edge degrades to
@@ -54,4 +54,4 @@ upstreams = ["[2606:4700:4700::1111]:53", "[2001:4860:4860::8888]:53"]
 # the native address and uses the NAT64 one only if native won't connect. Takes
 # effect only when "nat64" is among the synthesizers (i.e. a translator exists).
 # Default: true.
-# nat64_fallback = true
+nat64_fallback = true
