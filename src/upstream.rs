@@ -59,6 +59,33 @@ use crate::metrics::Metrics;
 
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How a resolved answer was sourced, for the Query log. Describes a single
+/// query's cache disposition; says nothing about any internal sub-lookups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheStatus {
+    /// The query never consulted the cache (caching disabled, or not cacheable —
+    /// e.g. a DNSSEC-aware query).
+    Uncached,
+    /// Cacheable, but not present: answered by an upstream round-trip.
+    Miss,
+    /// Served from a fresh cache entry.
+    Hit,
+    /// Served from an expired entry under serve-stale (RFC 8767).
+    Stale,
+}
+
+impl CacheStatus {
+    /// Short lowercase label for display.
+    pub fn label(self) -> &'static str {
+        match self {
+            CacheStatus::Uncached => "uncached",
+            CacheStatus::Miss => "miss",
+            CacheStatus::Hit => "hit",
+            CacheStatus::Stale => "stale",
+        }
+    }
+}
+
 /// Upper bound a cached TTL is clamped to (one day), matching common forwarder
 /// behaviour and RFC 2181 §8 guidance that implementations may cap received TTLs.
 const MAX_TTL: u32 = 86_400;
@@ -430,6 +457,13 @@ impl Pool {
     /// upstream. Returns `None` only if every upstream failed and no stale answer
     /// was available.
     pub async fn resolve(&self, query: Message) -> Option<DnsResponse> {
+        self.resolve_observed(query).await.0
+    }
+
+    /// Like [`resolve`](Self::resolve), but also reports how the answer was
+    /// sourced (cache hit / stale / miss / uncached) for the Query log. The
+    /// status describes *this* query's cache disposition only.
+    pub async fn resolve_observed(&self, query: Message) -> (Option<DnsResponse>, CacheStatus) {
         let inner = &self.inner;
         // Only cacheable queries get a key; everything else bypasses the cache.
         let key = inner
@@ -451,7 +485,7 @@ impl Pool {
                         if prefetch && self.spawn_refresh(query, question.clone()).is_some() {
                             inner.metrics.inc_prefetch();
                         }
-                        return Some(resp);
+                        return (Some(resp), CacheStatus::Hit);
                     }
                 }
                 Some(CacheLookup::Stale(response)) => {
@@ -460,14 +494,22 @@ impl Pool {
                         if negative {
                             inner.metrics.inc_negative_cache_hit();
                         }
-                        return Some(self.serve_stale(query, question.clone(), stale).await);
+                        let resp = self.serve_stale(query, question.clone(), stale).await;
+                        return (Some(resp), CacheStatus::Stale);
                     }
                 }
                 None => inner.metrics.inc_cache_miss(),
             }
         }
 
-        self.resolve_and_cache(query).await
+        // A miss when the query was cacheable (and a cache exists); otherwise the
+        // query never touched the cache at all.
+        let status = if key.is_some() {
+            CacheStatus::Miss
+        } else {
+            CacheStatus::Uncached
+        };
+        (self.resolve_and_cache(query).await, status)
     }
 
     /// Query upstream and, on a positive answer, store it in the cache. Returns the

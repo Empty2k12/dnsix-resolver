@@ -83,6 +83,21 @@ pub struct Config {
     #[serde(default)]
     pub metrics_listen: Option<SocketAddr>,
 
+    /// Optional address for the read-only observability dashboard (web UI).
+    /// Absent = dashboard disabled, and with it the Query log: no per-query data
+    /// (client IPs, queried names) is captured or stored unless this is set. The
+    /// UI serves sensitive data with no built-in auth, so bind it to a trusted
+    /// address or front it with an authenticating reverse proxy. On an IPv6-only
+    /// host use an IPv6 address (e.g. `[::]:8080`).
+    #[serde(default)]
+    pub ui_listen: Option<SocketAddr>,
+
+    /// Maximum number of recent queries the dashboard's in-memory Query log keeps
+    /// (a ring buffer; oldest entries are displaced). Only has effect when
+    /// `ui_listen` is set. Default 1000.
+    #[serde(default = "default_query_log_size")]
+    pub query_log_size: usize,
+
     /// Log verbosity, as a `tracing` env-filter directive (e.g. `"off"`, `"warn"`,
     /// `"info"`, `"debug"`, or per-target like `"dnsix=debug"`). Logging is opt-in:
     /// the default is `"off"`, so nothing is written unless you raise it. The
@@ -114,6 +129,10 @@ fn default_synthesizers() -> Vec<String> {
 
 fn default_nat64_fallback() -> bool {
     true
+}
+
+fn default_query_log_size() -> usize {
+    1000
 }
 
 fn default_log() -> String {
@@ -192,6 +211,20 @@ mod tests {
             Config::from_toml("metrics_listen = \"[::]:9153\"\nupstreams = [\"192.0.2.1:53\"]")
                 .unwrap();
         assert_eq!(cfg.metrics_listen, "[::]:9153".parse().ok());
+    }
+
+    #[test]
+    fn ui_listen_defaults_off_and_parses() {
+        let cfg = Config::from_toml("upstreams = [\"192.0.2.1:53\"]").unwrap();
+        assert_eq!(cfg.ui_listen, None);
+        assert_eq!(cfg.query_log_size, 1000);
+
+        let cfg = Config::from_toml(
+            "ui_listen = \"[::]:8080\"\nquery_log_size = 5000\nupstreams = [\"192.0.2.1:53\"]",
+        )
+        .unwrap();
+        assert_eq!(cfg.ui_listen, "[::]:8080".parse().ok());
+        assert_eq!(cfg.query_log_size, 5000);
     }
 
     #[test]

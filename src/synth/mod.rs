@@ -179,14 +179,15 @@ impl Chain {
         })
     }
 
-    /// Synthesize AAAA records for an AAAA-NODATA name, or `None` if no
+    /// Synthesize AAAA records for an AAAA-NODATA name, returning them together
+    /// with the id of the Synthesizer that produced them, or `None` if no
     /// Synthesizer produced any.
     pub async fn synthesize(
         &self,
         ctx: &SynthContext,
         pool: &Pool,
         metrics: &Metrics,
-    ) -> Option<Vec<Record>> {
+    ) -> Option<(Vec<Record>, &'static str)> {
         let a_addrs = ctx.a_addrs();
         for synth in &self.synths {
             let Some(plan) = synth.detect(ctx) else {
@@ -223,7 +224,7 @@ impl Chain {
                         }
                     }
                 }
-                return Some(records);
+                return Some((records, synth.id()));
             }
         }
         None
@@ -569,7 +570,8 @@ mod tests {
         let records = chain
             .synthesize(&shopify_ctx(), &empty_pool().await, &Metrics::new(&[]))
             .await
-            .expect("shopify matches");
+            .expect("shopify matches")
+            .0;
         // CDN-native first, NAT64 fallback appended after.
         assert_eq!(
             aaaa_addrs(&records),
@@ -592,7 +594,8 @@ mod tests {
         let records = chain
             .synthesize(&shopify_ctx(), &empty_pool().await, &Metrics::new(&[]))
             .await
-            .expect("shopify matches");
+            .expect("shopify matches")
+            .0;
         assert_eq!(
             aaaa_addrs(&records),
             vec!["2620:127:f00f::".parse::<Ipv6Addr>().unwrap()]
@@ -606,7 +609,8 @@ mod tests {
         let records = chain
             .synthesize(&shopify_ctx(), &empty_pool().await, &Metrics::new(&[]))
             .await
-            .expect("shopify matches");
+            .expect("shopify matches")
+            .0;
         assert_eq!(
             aaaa_addrs(&records),
             vec!["2620:127:f00f::".parse::<Ipv6Addr>().unwrap()]
@@ -622,7 +626,8 @@ mod tests {
         let records = chain
             .synthesize(&ctx, &empty_pool().await, &Metrics::new(&[]))
             .await
-            .expect("nat64 matches");
+            .expect("nat64 matches")
+            .0;
         assert_eq!(
             aaaa_addrs(&records),
             vec!["64:ff9b::5db8:d822".parse::<Ipv6Addr>().unwrap()]

@@ -10,8 +10,13 @@ hickory-proto = { version = "=0.25.2", features = ["tokio", "tls-ring", "webpki-
 moka = { version = "0.12", features = ["sync"] }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "test-util"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
 socket2 = "0.5"
+
+# Read-only observability dashboard (see src/web.rs).
+axum = "0.8"
+maud = { version = "0.27", features = ["axum"] }
 
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

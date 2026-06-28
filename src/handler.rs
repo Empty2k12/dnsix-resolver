@@ -11,6 +11,7 @@
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use hickory_proto::op::{Edns, Header, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
@@ -19,44 +20,74 @@ use hickory_server::authority::MessageResponseBuilder;
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 
 use crate::metrics::Metrics;
+use crate::querylog::{Outcome, QueryLog};
 use crate::synth::{Authority, Chain, SynthContext};
-use crate::upstream::Pool;
+use crate::upstream::{CacheStatus, Pool};
 
 /// EDNS payload size we advertise upstream and to clients.
 const EDNS_PAYLOAD: u16 = 1232;
+
+/// What a finished request observed, for the Query log. Carried back out of the
+/// per-path handlers so [`handle_request`](Dns64Handler::handle_request) can
+/// record one entry in a single place.
+struct Observation {
+    rcode: ResponseCode,
+    cache: CacheStatus,
+    outcome: Outcome,
+}
 
 pub struct Dns64Handler {
     pool: Arc<Pool>,
     chain: Arc<Chain>,
     metrics: Arc<Metrics>,
+    /// Present only when the dashboard is enabled; `None` means no per-query
+    /// capture happens at all.
+    query_log: Option<Arc<QueryLog>>,
 }
 
 impl Dns64Handler {
-    pub fn new(pool: Arc<Pool>, chain: Arc<Chain>, metrics: Arc<Metrics>) -> Self {
+    pub fn new(
+        pool: Arc<Pool>,
+        chain: Arc<Chain>,
+        metrics: Arc<Metrics>,
+        query_log: Option<Arc<QueryLog>>,
+    ) -> Self {
         Self {
             pool,
             chain,
             metrics,
+            query_log,
         }
     }
 
     /// The DNS64 synthesis path: parallel AAAA + A, decide, relay or synthesize.
+    /// Returns the response info plus an [`Observation`] for the Query log; the
+    /// cache disposition reported is that of the client-facing AAAA query.
     async fn handle_dns64<R: ResponseHandler>(
         &self,
         request: &Request,
         response_handle: R,
         query: &Query,
-    ) -> ResponseInfo {
+    ) -> (ResponseInfo, Observation) {
         let aaaa_q = upstream_query(request, query.clone());
         let mut a_query = Query::query(query.name().clone(), RecordType::A);
         a_query.set_query_class(DNSClass::IN);
         let a_q = upstream_query(request, a_query);
 
-        let (aaaa_res, a_res) = tokio::join!(self.pool.resolve(aaaa_q), self.pool.resolve(a_q));
+        let ((aaaa_res, cache), a_res) =
+            tokio::join!(self.pool.resolve_observed(aaaa_q), self.pool.resolve(a_q));
 
         let Some(aaaa) = aaaa_res else {
             self.metrics.record_rcode(ResponseCode::ServFail);
-            return serve_fail(request, response_handle).await;
+            let info = serve_fail(request, response_handle).await;
+            return (
+                info,
+                Observation {
+                    rcode: ResponseCode::ServFail,
+                    cache,
+                    outcome: Outcome::ServFail,
+                },
+            );
         };
 
         // Native AAAA present: relay untouched.
@@ -66,14 +97,31 @@ impl Dns64Handler {
             .any(|r| r.record_type() == RecordType::AAAA);
         if has_native_aaaa {
             self.metrics.inc_native_aaaa();
-            self.metrics.record_rcode(aaaa.response_code());
-            return relay(request, response_handle, &aaaa).await;
+            let rcode = aaaa.response_code();
+            self.metrics.record_rcode(rcode);
+            let info = relay(request, response_handle, &aaaa).await;
+            return (
+                info,
+                Observation {
+                    rcode,
+                    cache,
+                    outcome: Outcome::NativeAaaa,
+                },
+            );
         }
         // The name doesn't exist: relay the NXDOMAIN untouched.
         if aaaa.response_code() == ResponseCode::NXDomain {
             self.metrics.inc_nxdomain64();
             self.metrics.record_rcode(ResponseCode::NXDomain);
-            return relay(request, response_handle, &aaaa).await;
+            let info = relay(request, response_handle, &aaaa).await;
+            return (
+                info,
+                Observation {
+                    rcode: ResponseCode::NXDomain,
+                    cache,
+                    outcome: Outcome::Nxdomain,
+                },
+            );
         }
 
         // AAAA is NODATA — assemble the synthesis context and run the chain.
@@ -109,17 +157,35 @@ impl Dns64Handler {
         );
 
         match self.chain.synthesize(&ctx, &self.pool, &self.metrics).await {
-            Some(records) => {
+            Some((records, synth_id)) => {
                 self.metrics.inc_synthesized();
                 self.metrics.record_rcode(ResponseCode::NoError);
-                self.send_synthesized(request, response_handle, records)
-                    .await
+                let info = self
+                    .send_synthesized(request, response_handle, records)
+                    .await;
+                (
+                    info,
+                    Observation {
+                        rcode: ResponseCode::NoError,
+                        cache,
+                        outcome: Outcome::Synthesized(synth_id),
+                    },
+                )
             }
             // Nothing synthesized — relay the honest empty answer.
             None => {
                 self.metrics.inc_empty();
-                self.metrics.record_rcode(aaaa.response_code());
-                relay(request, response_handle, &aaaa).await
+                let rcode = aaaa.response_code();
+                self.metrics.record_rcode(rcode);
+                let info = relay(request, response_handle, &aaaa).await;
+                (
+                    info,
+                    Observation {
+                        rcode,
+                        cache,
+                        outcome: Outcome::EmptyNodata,
+                    },
+                )
             }
         }
     }
@@ -176,28 +242,64 @@ impl RequestHandler for Dns64Handler {
         let query = query.original().clone();
         self.metrics.record_qtype(query.query_type());
 
+        // Identity/timing captured up front, only if we'll record (dashboard on).
+        let started = self.query_log.as_ref().map(|_| Instant::now());
+
         let is_dns64 = query.query_type() == RecordType::AAAA
             && query.query_class() == DNSClass::IN
             && !request.checking_disabled();
 
-        if is_dns64 {
+        let (info, obs) = if is_dns64 {
             self.metrics.inc_queries_dns64();
             self.handle_dns64(request, response_handle, &query).await
         } else {
             // Passthrough: forward the exact query and relay the response.
             self.metrics.inc_queries_passthrough();
-            let msg = upstream_query(request, query);
-            match self.pool.resolve(msg).await {
+            let msg = upstream_query(request, query.clone());
+            let (resp, cache) = self.pool.resolve_observed(msg).await;
+            match resp {
                 Some(resp) => {
-                    self.metrics.record_rcode(resp.response_code());
-                    relay(request, response_handle, &resp).await
+                    let rcode = resp.response_code();
+                    self.metrics.record_rcode(rcode);
+                    let info = relay(request, response_handle, &resp).await;
+                    (
+                        info,
+                        Observation {
+                            rcode,
+                            cache,
+                            outcome: Outcome::Passthrough,
+                        },
+                    )
                 }
                 None => {
                     self.metrics.record_rcode(ResponseCode::ServFail);
-                    serve_fail(request, response_handle).await
+                    let info = serve_fail(request, response_handle).await;
+                    (
+                        info,
+                        Observation {
+                            rcode: ResponseCode::ServFail,
+                            cache,
+                            outcome: Outcome::Passthrough,
+                        },
+                    )
                 }
             }
+        };
+
+        // Capture one Query-log entry. Only when the dashboard is enabled.
+        if let (Some(log), Some(started)) = (&self.query_log, started) {
+            log.record(crate::querylog::Record {
+                client: request.src().ip(),
+                name: query.name().to_string(),
+                qtype: query.query_type(),
+                rcode: obs.rcode,
+                cache: obs.cache,
+                outcome: obs.outcome,
+                latency: started.elapsed(),
+            });
         }
+
+        info
     }
 }
 

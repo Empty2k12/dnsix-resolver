@@ -7,13 +7,15 @@
 mod config;
 mod handler;
 mod metrics;
+mod querylog;
 mod synth;
 mod upstream;
+mod web;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
 use clap::Parser;
@@ -24,6 +26,7 @@ use tracing_subscriber::EnvFilter;
 use crate::config::Config;
 use crate::handler::Dns64Handler;
 use crate::metrics::Metrics;
+use crate::querylog::QueryLog;
 use crate::synth::Chain;
 use crate::upstream::Pool;
 
@@ -59,6 +62,12 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Boot time, for the dashboard: the Prometheus counters are cumulative since
+    // this instant, so the UI shows it (and the running uptime) to make them
+    // interpretable. `Instant` drives uptime; `SystemTime` gives a wall clock.
+    let started = Instant::now();
+    let started_wall = SystemTime::now();
+
     let chain = Arc::new(Chain::build(
         &cfg.synthesizers,
         cfg.nat64_prefix,
@@ -76,6 +85,25 @@ async fn main() -> anyhow::Result<()> {
         None => info!("metrics endpoint disabled (set `metrics_listen` to enable)"),
     }
 
+    // The Query log — and thus all per-query capture — exists only when the
+    // dashboard is enabled. With `ui_listen` unset, no client IPs or queried
+    // names are ever stored.
+    let query_log = cfg
+        .ui_listen
+        .map(|_| Arc::new(QueryLog::new(cfg.query_log_size)));
+    match (cfg.ui_listen, query_log.clone()) {
+        (Some(addr), Some(log)) => {
+            tokio::spawn(web::serve(
+                addr,
+                metrics.clone(),
+                log,
+                started,
+                started_wall,
+            ));
+        }
+        _ => info!("dashboard disabled (set `ui_listen` to enable)"),
+    }
+
     info!(upstreams = ?cfg.upstreams, prefix = %cfg.nat64_prefix, cache_size = cfg.cache_size, serve_stale = cfg.serve_stale, synthesizers = ?cfg.synthesizers, "connecting to upstream resolvers");
     let pool = Arc::new(
         Pool::connect(
@@ -86,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let handler = Dns64Handler::new(pool, chain, metrics);
+    let handler = Dns64Handler::new(pool, chain, metrics, query_log);
 
     let mut server = hickory_server::ServerFuture::new(handler);
     server

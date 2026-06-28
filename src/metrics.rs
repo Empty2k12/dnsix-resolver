@@ -85,6 +85,27 @@ struct Counters {
     empty: AtomicU64,
 }
 
+/// A point-in-time copy of all counters, for the dashboard. Values are
+/// cumulative since process start. Each `(label, count)` list is in render order.
+pub struct MetricsSnapshot {
+    pub queries_dns64: u64,
+    pub queries_passthrough: u64,
+    pub upstream_failed: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub negative_cache_hits: u64,
+    pub served_stale: u64,
+    pub prefetches: u64,
+    pub native_aaaa: u64,
+    pub nxdomain64: u64,
+    pub nodata: u64,
+    pub synthesized: u64,
+    pub empty: u64,
+    pub rcode: Vec<(&'static str, u64)>,
+    pub qtype: Vec<(&'static str, u64)>,
+    pub synth: Vec<(&'static str, u64)>,
+}
+
 /// Process-wide metrics. Cheap to share behind an `Arc`.
 pub struct Metrics {
     c: Counters,
@@ -179,6 +200,49 @@ impl Metrics {
     pub fn synth_hit(&self, id: &str) {
         if let Some(i) = self.synth_ids.iter().position(|s| *s == id) {
             self.synth_hits[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A structured snapshot of every counter, for the dashboard (which needs the
+    /// values, not the Prometheus text). Each `(label, count)` list is in render
+    /// order and mirrors what [`render_prometheus`](Self::render_prometheus) emits.
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let r = &self.c.rcode;
+        MetricsSnapshot {
+            queries_dns64: g(&self.c.queries_dns64),
+            queries_passthrough: g(&self.c.queries_passthrough),
+            upstream_failed: g(&self.c.upstream_failed),
+            cache_hits: g(&self.c.cache_hits),
+            cache_misses: g(&self.c.cache_misses),
+            negative_cache_hits: g(&self.c.negative_cache_hits),
+            served_stale: g(&self.c.served_stale),
+            prefetches: g(&self.c.prefetches),
+            native_aaaa: g(&self.c.native_aaaa),
+            nxdomain64: g(&self.c.nxdomain64),
+            nodata: g(&self.c.nodata),
+            synthesized: g(&self.c.synthesized),
+            empty: g(&self.c.empty),
+            rcode: vec![
+                ("noerror", g(&r.noerror)),
+                ("nxdomain", g(&r.nxdomain)),
+                ("servfail", g(&r.servfail)),
+                ("notimp", g(&r.notimp)),
+                ("formerr", g(&r.formerr)),
+                ("refused", g(&r.refused)),
+                ("other", g(&r.other)),
+            ],
+            qtype: QTYPE_LABELS
+                .iter()
+                .zip(&self.qtype_counts)
+                .map(|(label, a)| (*label, g(a)))
+                .collect(),
+            synth: self
+                .synth_ids
+                .iter()
+                .zip(&self.synth_hits)
+                .map(|(id, a)| (*id, g(a)))
+                .collect(),
         }
     }
 

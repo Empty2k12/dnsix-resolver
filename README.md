@@ -28,6 +28,23 @@ cargo run -- --config config.toml
 Copy [`config.example.toml`](config.example.toml) to get started; only
 `upstreams` is required.
 
+## Observability
+
+Two optional, independently-enabled surfaces, both off by default:
+
+- **Prometheus metrics** (`metrics_listen`): aggregate counters at `GET /metrics`
+  for Zabbix or any Prometheus scraper.
+- **Dashboard** (`ui_listen`): a minimal, read-only web UI — a live query log
+  (streamed over Server-Sent Events) showing how each answer was produced
+  (which CDN Provider matched, NAT64 fallback, native AAAA, passthrough, cache
+  hit/stale), an Overview of counter-derived stats with a recent-rate sparkline
+  and the server's start time/uptime, and recent-window Top lists. Setting
+  `ui_listen` is also what enables the in-memory query log; with it unset, no
+  per-query data (client IPs, queried names) is captured. Neither surface has
+  built-in auth, so bind them to a trusted address or front them with an
+  authenticating reverse proxy. See
+  [`docs/adr/0003-observability-dashboard.md`](docs/adr/0003-observability-dashboard.md).
+
 [RFC 6147]: https://www.rfc-editor.org/rfc/rfc6147
 [miyurusankalpa/IPv6-dns-server]: https://gitlab.com/miyurusankalpa/IPv6-dns-server/
 [gpn24]: https://media.ccc.de/v/gpn24-503-delegacy-forcing-ipv6-at-scale
