@@ -31,8 +31,9 @@ use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
 use tokio_stream::StreamExt;
 use tracing::{error, info};
 
+use crate::blocklist::{Blocklist, SourceStat};
 use crate::metrics::Metrics;
-use crate::querylog::{Entry, QueryLog};
+use crate::querylog::{Entry, Outcome, QueryLog};
 
 /// How often the Overview pushes a refreshed stats block over SSE. One second
 /// keeps the uptime ticking smoothly; the payload is a couple of KB.
@@ -43,6 +44,8 @@ const OVERVIEW_TICK: Duration = Duration::from_secs(1);
 struct AppState {
     metrics: Arc<Metrics>,
     log: Arc<QueryLog>,
+    /// Present only when blocking is configured; drives the Blocklists page.
+    blocklist: Option<Arc<Blocklist>>,
     started: Instant,
     started_wall: SystemTime,
 }
@@ -53,12 +56,14 @@ pub async fn serve(
     addr: SocketAddr,
     metrics: Arc<Metrics>,
     log: Arc<QueryLog>,
+    blocklist: Option<Arc<Blocklist>>,
     started: Instant,
     started_wall: SystemTime,
 ) {
     let state = AppState {
         metrics,
         log,
+        blocklist,
         started,
         started_wall,
     };
@@ -66,6 +71,7 @@ pub async fn serve(
         .route("/", get(overview))
         .route("/log", get(log_page))
         .route("/top", get(top_page))
+        .route("/blocklists", get(blocklists_page))
         .route("/events", get(events))
         .route("/events/overview", get(overview_events))
         .route("/style.css", get(stylesheet))
@@ -124,7 +130,12 @@ fn overview_dash(st: &AppState) -> Markup {
     let m = st.metrics.snapshot();
     let entries = st.log.snapshot_newest_first();
 
-    let total = m.queries_dns64 + m.queries_passthrough;
+    let total = m.queries_dns64 + m.queries_passthrough + m.blocked;
+    let blocked_pct = if total > 0 {
+        m.blocked as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    };
     let cache_total = m.cache_hits + m.cache_misses;
     let hit_rate = if cache_total > 0 {
         m.cache_hits as f64 / cache_total as f64 * 100.0
@@ -136,6 +147,7 @@ fn overview_dash(st: &AppState) -> Markup {
     let kind = vec![
         ("dns64 (AAAA synthesis)", m.queries_dns64),
         ("passthrough", m.queries_passthrough),
+        ("blocked", m.blocked),
     ];
     let dns64 = vec![
         ("native AAAA", m.native_aaaa),
@@ -159,6 +171,7 @@ fn overview_dash(st: &AppState) -> Markup {
             (card(&fmt_uptime(st.started.elapsed()), "Uptime", &format!("started {since}")))
             (card(&format!("{hit_rate:.1}%"), "Cache hit rate", &format!("{} hits · {} misses", m.cache_hits, m.cache_misses)))
             (card(&m.synthesized.to_string(), "Synthesized", &format!("{} nodata · {} empty", m.nodata, m.empty)))
+            (card(&m.blocked.to_string(), "Blocked", &format!("{blocked_pct:.1}% of queries")))
         }
         section.panel {
             h2 { "Query rate" }
@@ -212,6 +225,12 @@ async fn top_page(State(st): State<AppState>) -> Markup {
     let domains = top_counts(entries.iter().map(|e| e.name.clone()));
     let clients = top_counts(entries.iter().map(|e| e.client.to_string()));
     let outcomes = top_counts(entries.iter().map(|e| e.outcome.label()));
+    let blocked = top_counts(
+        entries
+            .iter()
+            .filter(|e| matches!(e.outcome, Outcome::Blocked))
+            .map(|e| e.name.clone()),
+    );
 
     page(
         "Top",
@@ -223,9 +242,72 @@ async fn top_page(State(st): State<AppState>) -> Markup {
                 section.panel { h2 { "Top domains" } (top_table(&domains)) }
                 section.panel { h2 { "Top clients" } (top_table(&clients)) }
                 section.panel { h2 { "Top outcomes" } (top_table(&outcomes)) }
+                section.panel { h2 { "Top blocked domains" } (top_table(&blocked)) }
             }
         },
     )
+}
+
+/// The Blocklists page: a read-only view of the statically-loaded blocklist,
+/// what loaded, what failed, and the deduplicated totals. The dashboard reports
+/// blocking; it never edits it (the lists are static config).
+async fn blocklists_page(State(st): State<AppState>) -> Markup {
+    page(
+        "Blocklists",
+        "blocklists",
+        None,
+        html! {
+            @match &st.blocklist {
+                None => {
+                    section.panel {
+                        h2 { "Blocklist" }
+                        p.muted { "Blocking is disabled. Set " code { "blocklists" } " in the config to enable it." }
+                    }
+                }
+                Some(bl) => {
+                    section.cards {
+                        (card(&fmt_count(bl.block_count()), "Blocked domains", "unique, after dedup"))
+                        (card(&fmt_count(bl.allow_count()), "Allowlist exceptions", "@@ rules honored"))
+                        (card(&bl.sources().len().to_string(), "Sources", "fetched once at startup"))
+                    }
+                    section.panel {
+                        h2 { "Sources" }
+                        p.muted.small { "Fetched once at startup and immutable; restart to update. A failed source is skipped (fail-open)." }
+                        div.tablewrap {
+                            table.log {
+                                thead {
+                                    tr {
+                                        th { "Source" } th { "Status" }
+                                        th.num { "Blocked" } th.num { "Allowed" } th.num { "Skipped" }
+                                    }
+                                }
+                                tbody {
+                                    @for s in bl.sources() { (source_row(s)) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
+
+/// One row of the Blocklists "Sources" table.
+fn source_row(s: &SourceStat) -> Markup {
+    let (cls, label) = match &s.status {
+        crate::blocklist::SourceStatus::Ok => ("ok", "ok".to_string()),
+        crate::blocklist::SourceStatus::Failed(why) => ("failed", format!("failed: {why}")),
+    };
+    html! {
+        tr {
+            td.mono.name { (s.url) }
+            td { span class={ "badge source-" (cls) } { (label) } }
+            td.num { (fmt_count(s.blocks)) }
+            td.num { (fmt_count(s.allows)) }
+            td.num { (fmt_count(s.skipped)) }
+        }
+    }
 }
 
 /// SSE: stream each new Query-log entry as a rendered `<tr>` fragment the page's
@@ -272,6 +354,7 @@ fn page(title: &str, active: &str, refresh: Option<u32>, body: Markup) -> Markup
                         a.active[is("overview")] href="/" { "Overview" }
                         a.active[is("log")] href="/log" { "Live log" }
                         a.active[is("top")] href="/top" { "Top" }
+                        a.active[is("blocklists")] href="/blocklists" { "Blocklists" }
                     }
                 }
                 main { (body) }
@@ -409,6 +492,22 @@ where
     v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     v.truncate(10);
     v
+}
+
+/// Group a count with thin spaces every three digits, so blocklist sizes in the
+/// hundreds of thousands stay readable (e.g. `1 234 567`).
+fn fmt_count(n: usize) -> String {
+    let digits = n.to_string();
+    let len = digits.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        // A thin space before every group of three counted from the right.
+        if i != 0 && (len - i).is_multiple_of(3) {
+            out.push('\u{2009}');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn rcode_label(c: ResponseCode) -> String {
@@ -583,6 +682,10 @@ table.log tbody tr:hover { background: var(--accent-soft); }
 .outcome-passthrough { background: var(--neutral-bg); color: var(--neutral); }
 .outcome-nxdomain, .outcome-empty { background: var(--neutral-bg); color: var(--muted); }
 .outcome-servfail { background: var(--bad-bg); color: var(--bad); }
+/* Blocked is a policy disposition, not a reachability grade: its own accent. */
+.outcome-blocked { background: var(--accent-soft); color: var(--accent); }
+.source-ok { background: var(--ok-bg); color: var(--ok); }
+.source-failed { background: var(--bad-bg); color: var(--bad); }
 .loghead { display: flex; align-items: center; gap: 10px; }
 .loghead h2 { margin: 0; }
 .live { display: inline-flex; align-items: center; gap: 6px; color: var(--ok); font-size: 11px; font-weight: 700; text-transform: uppercase; }
@@ -591,3 +694,28 @@ table.log tbody tr:hover { background: var(--accent-soft); }
 svg.spark { width: 100%; height: 90px; display: block; }
 svg.spark polyline { fill: none; stroke: var(--accent); stroke-width: 2; vector-effect: non-scaling-stroke; }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Digit grouping must not panic at any length (regression: the 5- and
+    /// 8-digit cases used to subtract with overflow).
+    #[test]
+    fn fmt_count_groups_without_overflow() {
+        const NB: char = '\u{2009}';
+        assert_eq!(fmt_count(0), "0");
+        assert_eq!(fmt_count(7), "7");
+        assert_eq!(fmt_count(42), "42");
+        assert_eq!(fmt_count(999), "999");
+        assert_eq!(fmt_count(1_000), format!("1{NB}000"));
+        assert_eq!(fmt_count(12_345), format!("12{NB}345"));
+        assert_eq!(fmt_count(123_456), format!("123{NB}456"));
+        assert_eq!(fmt_count(1_234_567), format!("1{NB}234{NB}567"));
+        // Exercise every length 1..=9 to be sure none panic.
+        for len in 1..=9 {
+            let n: usize = "9".repeat(len).parse().unwrap();
+            let _ = fmt_count(n);
+        }
+    }
+}

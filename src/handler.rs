@@ -19,6 +19,7 @@ use hickory_proto::xfer::DnsResponse;
 use hickory_server::authority::MessageResponseBuilder;
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 
+use crate::blocklist::Blocklist;
 use crate::metrics::Metrics;
 use crate::querylog::{Outcome, QueryLog};
 use crate::synth::{Authority, Chain, SynthContext};
@@ -43,6 +44,8 @@ pub struct Dns64Handler {
     /// Present only when the dashboard is enabled; `None` means no per-query
     /// capture happens at all.
     query_log: Option<Arc<QueryLog>>,
+    /// Present only when `blocklists` are configured; `None` means no blocking.
+    blocklist: Option<Arc<Blocklist>>,
 }
 
 impl Dns64Handler {
@@ -51,12 +54,14 @@ impl Dns64Handler {
         chain: Arc<Chain>,
         metrics: Arc<Metrics>,
         query_log: Option<Arc<QueryLog>>,
+        blocklist: Option<Arc<Blocklist>>,
     ) -> Self {
         Self {
             pool,
             chain,
             metrics,
             query_log,
+            blocklist,
         }
     }
 
@@ -245,11 +250,32 @@ impl RequestHandler for Dns64Handler {
         // Identity/timing captured up front, only if we'll record (dashboard on).
         let started = self.query_log.as_ref().map(|_| Instant::now());
 
+        // Blocklist: a pre-resolution short-circuit. A name on the blocklist is
+        // answered NXDOMAIN locally (before any cache lookup or upstream query),
+        // for every query type, and unconditionally (the CD/DO bits govern DNSSEC
+        // validation, not content policy, so they are not a block bypass).
+        let blocked = self
+            .blocklist
+            .as_ref()
+            .is_some_and(|bl| bl.is_blocked(query.name()));
+
         let is_dns64 = query.query_type() == RecordType::AAAA
             && query.query_class() == DNSClass::IN
             && !request.checking_disabled();
 
-        let (info, obs) = if is_dns64 {
+        let (info, obs) = if blocked {
+            self.metrics.inc_blocked();
+            self.metrics.record_rcode(ResponseCode::NXDomain);
+            let info = serve_error(request, response_handle, ResponseCode::NXDomain).await;
+            (
+                info,
+                Observation {
+                    rcode: ResponseCode::NXDomain,
+                    cache: CacheStatus::Uncached,
+                    outcome: Outcome::Blocked,
+                },
+            )
+        } else if is_dns64 {
             self.metrics.inc_queries_dns64();
             self.handle_dns64(request, response_handle, &query).await
         } else {

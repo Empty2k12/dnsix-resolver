@@ -295,10 +295,12 @@ dependencies = [
  "serde",
  "socket2 0.5.10",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

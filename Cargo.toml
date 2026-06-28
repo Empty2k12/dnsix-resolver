@@ -9,6 +9,12 @@ hickory-client = "=0.25.2"
 hickory-proto = { version = "=0.25.2", features = ["tokio", "tls-ring", "webpki-roots"] }
 moka = { version = "0.12", features = ["sync"] }
 
+# Startup blocklist fetch (see src/blocklist.rs): a minimal HTTPS GET over the
+# same rustls/ring + webpki-roots stack the DoT upstreams already use, so it adds
+# no new TLS dependency and trusts the bundled roots (not the host store).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "0.26"
+
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "test-util"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"

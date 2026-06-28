@@ -71,6 +71,7 @@ struct RcodeCounters {
 struct Counters {
     queries_dns64: AtomicU64,
     queries_passthrough: AtomicU64,
+    blocked: AtomicU64,
     rcode: RcodeCounters,
     upstream_failed: AtomicU64,
     cache_hits: AtomicU64,
@@ -90,6 +91,7 @@ struct Counters {
 pub struct MetricsSnapshot {
     pub queries_dns64: u64,
     pub queries_passthrough: u64,
+    pub blocked: u64,
     pub upstream_failed: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
@@ -140,6 +142,9 @@ impl Metrics {
     }
     pub fn inc_queries_passthrough(&self) {
         self.c.queries_passthrough.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_blocked(&self) {
+        self.c.blocked.fetch_add(1, Ordering::Relaxed);
     }
     pub fn inc_upstream_failed(&self) {
         self.c.upstream_failed.fetch_add(1, Ordering::Relaxed);
@@ -212,6 +217,7 @@ impl Metrics {
         MetricsSnapshot {
             queries_dns64: g(&self.c.queries_dns64),
             queries_passthrough: g(&self.c.queries_passthrough),
+            blocked: g(&self.c.blocked),
             upstream_failed: g(&self.c.upstream_failed),
             cache_hits: g(&self.c.cache_hits),
             cache_misses: g(&self.c.cache_misses),
@@ -266,6 +272,11 @@ impl Metrics {
             s,
             "dns_queries_total{{kind=\"passthrough\"}} {}",
             g(&self.c.queries_passthrough)
+        );
+        let _ = writeln!(
+            s,
+            "dns_queries_total{{kind=\"blocked\"}} {}",
+            g(&self.c.blocked)
         );
 
         let _ = writeln!(

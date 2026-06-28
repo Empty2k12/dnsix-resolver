@@ -13,6 +13,11 @@
 mod cdn;
 mod nat64;
 
+// Reused by the blocklist fetch (src/blocklist.rs) to reach IPv4-only list hosts
+// from an IPv6-only box: resolve A, keep the globally-routable ones, embed into
+// the NAT64 prefix — the same DNS64 path the Forwarder serves to clients.
+pub use nat64::{eligible_addresses, embed};
+
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};

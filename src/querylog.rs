@@ -45,6 +45,8 @@ pub enum Outcome {
     EmptyNodata,
     /// A non-AAAA (or CD-bit) query relayed transparently.
     Passthrough,
+    /// The name was on the **Blocklist**: answered NXDOMAIN locally, no upstream.
+    Blocked,
     /// Every upstream failed; the client got SERVFAIL.
     ServFail,
 }
@@ -63,6 +65,7 @@ impl Outcome {
             Outcome::Synthesized(_) => "synth",
             Outcome::EmptyNodata => "empty",
             Outcome::Passthrough => "passthrough",
+            Outcome::Blocked => "blocked",
             Outcome::ServFail => "servfail",
         }
     }
@@ -75,6 +78,7 @@ impl Outcome {
             Outcome::Synthesized(id) => format!("synth:{id}"),
             Outcome::EmptyNodata => "empty".to_string(),
             Outcome::Passthrough => "passthrough".to_string(),
+            Outcome::Blocked => "blocked".to_string(),
             Outcome::ServFail => "servfail".to_string(),
         }
     }

@@ -77,6 +77,17 @@ pub struct Config {
     #[serde(default = "default_nat64_fallback")]
     pub nat64_fallback: bool,
 
+    /// Optional **Blocklist** sources: a list of `https://` URLs to hosts-format
+    /// or adblock-syntax lists. Empty (the default) = no blocking, exactly as
+    /// before. The lists are fetched **once at startup** (the Forwarder resolves
+    /// each host through its own upstreams and reaches it over NAT64) and are
+    /// immutable thereafter; to update them, restart. A blocked name is answered
+    /// NXDOMAIN locally, never via an upstream. A source that fails to fetch is
+    /// skipped (fail-open) so a list-CDN outage cannot take DNS resolution down.
+    /// See docs/adr/0004-local-blocklist.md.
+    #[serde(default)]
+    pub blocklists: Vec<String>,
+
     /// Optional address for the Prometheus metrics endpoint (`GET /metrics`).
     /// Absent = metrics server disabled. On an IPv6-only host use an IPv6 address
     /// (e.g. `[::]:9153`).
@@ -245,6 +256,20 @@ mod tests {
         let cfg =
             Config::from_toml("nat64_fallback = false\nupstreams = [\"192.0.2.1:53\"]").unwrap();
         assert!(!cfg.nat64_fallback);
+    }
+
+    #[test]
+    fn blocklists_default_empty_and_parse() {
+        let cfg = Config::from_toml("upstreams = [\"192.0.2.1:53\"]").unwrap();
+        assert!(cfg.blocklists.is_empty());
+
+        let cfg = Config::from_toml(
+            "blocklists = [\"https://example.com/hosts\", \"https://example.org/pro.txt\"]\n\
+             upstreams = [\"192.0.2.1:53\"]",
+        )
+        .unwrap();
+        assert_eq!(cfg.blocklists.len(), 2);
+        assert_eq!(cfg.blocklists[0], "https://example.com/hosts");
     }
 
     #[test]

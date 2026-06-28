@@ -4,6 +4,7 @@
 //! synthesizing AAAA records (RFC 6147) for IPv4-only names so IPv6-only clients
 //! reach IPv4-only hosts via a companion NAT64 translator.
 
+mod blocklist;
 mod config;
 mod handler;
 mod metrics;
@@ -91,18 +92,6 @@ async fn main() -> anyhow::Result<()> {
     let query_log = cfg
         .ui_listen
         .map(|_| Arc::new(QueryLog::new(cfg.query_log_size)));
-    match (cfg.ui_listen, query_log.clone()) {
-        (Some(addr), Some(log)) => {
-            tokio::spawn(web::serve(
-                addr,
-                metrics.clone(),
-                log,
-                started,
-                started_wall,
-            ));
-        }
-        _ => info!("dashboard disabled (set `ui_listen` to enable)"),
-    }
 
     info!(upstreams = ?cfg.upstreams, prefix = %cfg.nat64_prefix, cache_size = cfg.cache_size, serve_stale = cfg.serve_stale, synthesizers = ?cfg.synthesizers, "connecting to upstream resolvers");
     let pool = Arc::new(
@@ -114,7 +103,40 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let handler = Dns64Handler::new(pool, chain, metrics, query_log);
+
+    // Load the Blocklist (if configured) once, now that the pool exists — the
+    // fetch resolves list hosts through it and reaches them over NAT64. Fail-open
+    // per source: a list that won't load is skipped, never aborting startup.
+    let blocklist = if cfg.blocklists.is_empty() {
+        info!("blocklist disabled (set `blocklists` to enable)");
+        None
+    } else {
+        info!(sources = cfg.blocklists.len(), "loading blocklists");
+        let bl = blocklist::load(&cfg.blocklists, &pool, cfg.nat64_prefix).await;
+        info!(
+            blocked = bl.block_count(),
+            allowed = bl.allow_count(),
+            "blocklist loaded"
+        );
+        Some(Arc::new(bl))
+    };
+
+    // Start the dashboard once the data it shows (query log + blocklist) exists.
+    match (cfg.ui_listen, query_log.clone()) {
+        (Some(addr), Some(log)) => {
+            tokio::spawn(web::serve(
+                addr,
+                metrics.clone(),
+                log,
+                blocklist.clone(),
+                started,
+                started_wall,
+            ));
+        }
+        _ => info!("dashboard disabled (set `ui_listen` to enable)"),
+    }
+
+    let handler = Dns64Handler::new(pool, chain, metrics, query_log, blocklist);
 
     let mut server = hickory_server::ServerFuture::new(handler);
     server
