@@ -34,7 +34,7 @@
 //! clear are cached, so DNSSEC-aware clients always get an untouched,
 //! full-fidelity upstream response.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -51,6 +51,7 @@ use hickory_proto::tcp::TcpClientStream;
 use hickory_proto::udp::UdpClientStream;
 use hickory_proto::xfer::{DnsHandle, DnsResponse};
 use moka::{sync::Cache, Expiry};
+use tokio::sync::broadcast;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
@@ -373,6 +374,12 @@ struct Inner {
     /// Queries with a refresh (serve-stale or prefetch) currently in flight, so we
     /// never run more than one upstream refresh for the same name at a time.
     in_flight: Mutex<HashSet<Query>>,
+    /// Foreground cache misses currently resolving upstream, keyed by question. A
+    /// concurrent burst of identical misses collapses to a single upstream round
+    /// trip: the first caller (leader) resolves and broadcasts its answer to the
+    /// waiters (followers). Distinct from `in_flight`, which dedups *background*
+    /// refreshes whose result only repopulates the cache.
+    single_flight: Mutex<HashMap<Query, broadcast::Sender<Option<DnsResponse>>>>,
 }
 
 impl Inner {
@@ -449,6 +456,7 @@ impl Pool {
                 cache,
                 metrics,
                 in_flight: Mutex::new(HashSet::new()),
+                single_flight: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -509,7 +517,53 @@ impl Pool {
         } else {
             CacheStatus::Uncached
         };
-        (self.resolve_and_cache(query).await, status)
+        (self.resolve_coalesced(query, key).await, status)
+    }
+
+    /// Resolve a cache miss, collapsing a concurrent burst of identical cacheable
+    /// misses into a single upstream round trip. The first caller for a given
+    /// question (the leader) resolves and caches; the rest (followers) await its
+    /// answer over a broadcast instead of each hitting upstream. An uncacheable
+    /// query (`key` is `None`) has nothing to key on and resolves directly.
+    async fn resolve_coalesced(&self, query: Message, key: Option<Query>) -> Option<DnsResponse> {
+        let Some(key) = key else {
+            return self.resolve_and_cache(query).await;
+        };
+
+        // Become the leader (first in) or a follower (someone is already resolving
+        // this exact question). The lock is held only for the map lookup/insert.
+        enum Role {
+            Leader(broadcast::Sender<Option<DnsResponse>>),
+            Follower(broadcast::Receiver<Option<DnsResponse>>),
+        }
+        let role = {
+            let mut map = self.inner.single_flight.lock().unwrap();
+            match map.get(&key) {
+                Some(tx) => Role::Follower(tx.subscribe()),
+                None => {
+                    let (tx, _rx) = broadcast::channel(1);
+                    map.insert(key.clone(), tx.clone());
+                    Role::Leader(tx)
+                }
+            }
+        };
+
+        match role {
+            Role::Follower(mut rx) => match rx.recv().await {
+                // The leader's answer, delivered without a second upstream query.
+                Ok(resp) => resp,
+                // Leader panicked before publishing, or we lagged: resolve our own.
+                Err(_) => self.resolve_and_cache(query).await,
+            },
+            Role::Leader(tx) => {
+                let resp = self.resolve_and_cache(query).await;
+                // Free the slot before broadcasting, so a later burst starts fresh.
+                self.inner.single_flight.lock().unwrap().remove(&key);
+                // Ignore the error when no follower is waiting.
+                let _ = tx.send(resp.clone());
+                resp
+            }
+        }
     }
 
     /// Query upstream and, on a positive answer, store it in the cache. Returns the
@@ -722,7 +776,11 @@ impl StaleCache {
         }
     }
 
-    /// Cache a positive answer, with a deadline of `min(answer TTLs, MAX_TTL)`.
+    /// Cache a positive answer, with a deadline of `min(answer TTLs, MAX_TTL)`. A
+    /// TTL of 0 means the publisher opted the record out of caching (RFC 2181 §8);
+    /// storing it would make it immediately expired and, with serve-stale on, keep
+    /// it served stale for up to the whole stale window — the opposite of intent —
+    /// so we skip it and let the answer pass through uncached.
     fn insert(&self, question: Query, answers: Vec<Record>, now: Instant) {
         let ttl = answers
             .iter()
@@ -730,6 +788,9 @@ impl StaleCache {
             .min()
             .unwrap_or(0)
             .min(MAX_TTL);
+        if ttl == 0 {
+            return;
+        }
         self.store(
             question,
             CacheEntry {
@@ -761,6 +822,11 @@ impl StaleCache {
             .min()
             .unwrap_or(0)
             .min(NEG_MAX_TTL);
+        // A zero negative TTL (SOA MINIMUM 0) is uncacheable for the same reason a
+        // zero positive TTL is: skip it rather than store an already-stale entry.
+        if ttl == 0 {
+            return;
+        }
         self.store(
             question,
             CacheEntry {
@@ -981,6 +1047,43 @@ mod tests {
             }
             _ => panic!("expected a stale hit"),
         }
+    }
+
+    /// A TTL-0 positive answer is deliberately uncacheable (RFC 2181 §8): storing
+    /// it would make it immediately expired and, with serve-stale on, served stale
+    /// for the whole window. It must not be stored at all.
+    #[test]
+    fn ttl_zero_positive_answer_is_not_cached() {
+        let cache = StaleCache::new(64, STALE_MAX_WINDOW);
+        let q = a_query("example.com.");
+        let now = Instant::now();
+        cache.insert(
+            q.clone(),
+            vec![a_record("example.com.", [1, 2, 3, 4], 0)],
+            now,
+        );
+        assert!(
+            cache.get(&q, now).is_none(),
+            "a TTL-0 answer must not be cached (not even as an immediately-stale entry)"
+        );
+    }
+
+    /// The same rule for a negative answer whose SOA MINIMUM is 0.
+    #[test]
+    fn ttl_zero_negative_answer_is_not_cached() {
+        let cache = StaleCache::new(64, STALE_MAX_WINDOW);
+        let q = a_query("nope.example.com.");
+        let now = Instant::now();
+        cache.insert_negative(
+            q.clone(),
+            ResponseCode::NXDomain,
+            vec![soa_record("example.com.", 0, 0)],
+            now,
+        );
+        assert!(
+            cache.get(&q, now).is_none(),
+            "a TTL-0 negative answer must not be cached"
+        );
     }
 
     #[test]
@@ -1429,6 +1532,30 @@ mod tests {
             mock.calls(),
             1,
             "the in-flight guard collapses the burst to one refresh"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_cold_misses_collapse_to_one_upstream_query() {
+        let metrics = Arc::new(Metrics::new(&[]));
+        // A slow upstream so all five identical misses overlap in flight.
+        let mock = MockResolver::new(
+            Some((Ipv4Addr::new(1, 2, 3, 4), 300)),
+            Duration::from_secs(1),
+        );
+        let pool = pool_with(mock.clone(), true, metrics.clone());
+
+        let answers = join_all((0..5).map(|_| pool.resolve(query_msg("example.com.")))).await;
+        assert!(
+            answers.iter().all(|a| a
+                .as_ref()
+                .is_some_and(|r| first_answer_ip(r) == Ipv4Addr::new(1, 2, 3, 4))),
+            "every concurrent miss receives the leader's answer"
+        );
+        assert_eq!(
+            mock.calls(),
+            1,
+            "single-flight collapses the burst of identical misses to one upstream query"
         );
     }
 

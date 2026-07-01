@@ -19,6 +19,7 @@ use hickory_proto::xfer::DnsResponse;
 use hickory_server::authority::MessageResponseBuilder;
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 
+use crate::acl::ClientAcl;
 use crate::blocklist::Blocklist;
 use crate::metrics::Metrics;
 use crate::querylog::{Outcome, QueryLog};
@@ -46,6 +47,9 @@ pub struct Dns64Handler {
     query_log: Option<Arc<QueryLog>>,
     /// Present only when `blocklists` are configured; `None` means no blocking.
     blocklist: Option<Arc<Blocklist>>,
+    /// Present only when `client_networks` is configured; `None` means every
+    /// client is allowed (an open resolver on the bound interface).
+    client_acl: Option<Arc<ClientAcl>>,
 }
 
 impl Dns64Handler {
@@ -55,6 +59,7 @@ impl Dns64Handler {
         metrics: Arc<Metrics>,
         query_log: Option<Arc<QueryLog>>,
         blocklist: Option<Arc<Blocklist>>,
+        client_acl: Option<Arc<ClientAcl>>,
     ) -> Self {
         Self {
             pool,
@@ -62,6 +67,7 @@ impl Dns64Handler {
             metrics,
             query_log,
             blocklist,
+            client_acl,
         }
     }
 
@@ -125,6 +131,23 @@ impl Dns64Handler {
                     rcode: ResponseCode::NXDomain,
                     cache,
                     outcome: Outcome::Nxdomain,
+                },
+            );
+        }
+        // Any other non-NoError code (REFUSED, NOTIMP, FORMERR, ...) is an upstream
+        // error, not AAAA-NODATA. Relay it untouched rather than masking it with a
+        // synthesized answer — RFC 6147 synthesizes on AAAA-NODATA only, and a
+        // parallel A hit must never turn an upstream error into a NoError answer.
+        if aaaa.response_code() != ResponseCode::NoError {
+            let rcode = aaaa.response_code();
+            self.metrics.record_rcode(rcode);
+            let info = relay(request, response_handle, &aaaa).await;
+            return (
+                info,
+                Observation {
+                    rcode,
+                    cache,
+                    outcome: Outcome::Passthrough,
                 },
             );
         }
@@ -250,6 +273,15 @@ impl RequestHandler for Dns64Handler {
         // Identity/timing captured up front, only if we'll record (dashboard on).
         let started = self.query_log.as_ref().map(|_| Instant::now());
 
+        // Client ACL: an explicit trust boundary evaluated before any other work.
+        // With no allowlist configured every client is allowed (the historical
+        // open-resolver behaviour); with one set, a client outside it is REFUSED
+        // before any cache lookup or upstream query.
+        let refused = self
+            .client_acl
+            .as_ref()
+            .is_some_and(|acl| !acl.allows(request.src().ip()));
+
         // Blocklist: a pre-resolution short-circuit. A name on the blocklist is
         // answered NXDOMAIN locally (before any cache lookup or upstream query),
         // for every query type, and unconditionally (the CD/DO bits govern DNSSEC
@@ -263,7 +295,18 @@ impl RequestHandler for Dns64Handler {
             && query.query_class() == DNSClass::IN
             && !request.checking_disabled();
 
-        let (info, obs) = if blocked {
+        let (info, obs) = if refused {
+            self.metrics.record_rcode(ResponseCode::Refused);
+            let info = serve_error(request, response_handle, ResponseCode::Refused).await;
+            (
+                info,
+                Observation {
+                    rcode: ResponseCode::Refused,
+                    cache: CacheStatus::Uncached,
+                    outcome: Outcome::Refused,
+                },
+            )
+        } else if blocked {
             self.metrics.inc_blocked();
             self.metrics.record_rcode(ResponseCode::NXDomain);
             let info = serve_error(request, response_handle, ResponseCode::NXDomain).await;

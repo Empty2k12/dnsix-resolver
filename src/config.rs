@@ -109,6 +109,15 @@ pub struct Config {
     #[serde(default = "default_query_log_size")]
     pub query_log_size: usize,
 
+    /// Optional allowlist of IPv6 client networks (CIDR, e.g. `"2001:db8::/32"`;
+    /// a bare address is a `/128` host route) permitted to query the Forwarder.
+    /// Empty (the default) allows **every** client — an open resolver on the bound
+    /// interface — so set this (and/or a host firewall on port 53) to make the DNS
+    /// trust boundary explicit. The listener is IPv6-only, so entries must be IPv6;
+    /// a client outside every listed network is answered REFUSED. See [`crate::acl`].
+    #[serde(default)]
+    pub client_networks: Vec<String>,
+
     /// Log verbosity, as a `tracing` env-filter directive (e.g. `"off"`, `"warn"`,
     /// `"info"`, `"debug"`, or per-target like `"dnsix=debug"`). Logging is opt-in:
     /// the default is `"off"`, so nothing is written unless you raise it. The
@@ -185,6 +194,9 @@ impl Config {
                 self.nat64_prefix
             );
         }
+        // Surface a malformed client_networks CIDR (or an IPv4 entry, which the
+        // IPv6-only listener could never match) at startup rather than per-query.
+        crate::acl::ClientAcl::parse(&self.client_networks)?;
         Ok(())
     }
 }
@@ -192,6 +204,18 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shipped example must always parse and pass validation (it uses
+    /// `deny_unknown_fields`, so a stale key would fail here). Guards against the
+    /// example config drifting from the actual schema.
+    #[test]
+    fn shipped_example_config_parses_and_validates() {
+        let text = include_str!("../config.example.toml");
+        let cfg = Config::from_toml(text).expect("config.example.toml must parse and validate");
+        assert!(cfg.listen.is_ipv6());
+        // The example ships with an explicit client allowlist, not an open resolver.
+        assert!(!cfg.client_networks.is_empty());
+    }
 
     #[test]
     fn minimal_config_uses_defaults() {

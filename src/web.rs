@@ -14,14 +14,15 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
-use axum::http::header;
+use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use futures_util::Stream;
@@ -75,6 +76,7 @@ pub async fn serve(
         .route("/events", get(events))
         .route("/events/overview", get(overview_events))
         .route("/style.css", get(stylesheet))
+        .layer(middleware::from_fn(rebinding_guard))
         .with_state(state);
 
     let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -87,6 +89,55 @@ pub async fn serve(
     info!(%addr, "dashboard listening (read-only, unauthenticated)");
     if let Err(err) = axum::serve(listener, app).await {
         error!(error = %err, "dashboard: server error");
+    }
+}
+
+/// Anti-DNS-rebinding guard. The dashboard has no auth (ADR 0003) and serves the
+/// Query log (client IPs and every queried name), so a browser on the trusted
+/// network could otherwise be rebound — an attacker page whose hostname re-resolves
+/// to this server's address — and read `/events` cross-origin. That risk is sharper
+/// here because this server is itself a resolver the rebinding name may resolve
+/// through. A rebound request still carries the attacker's *hostname* in `Host`,
+/// whereas an operator reaches the UI by IP literal or over `localhost`, so we
+/// accept only those and reject anything else with 403.
+async fn rebinding_guard(req: axum::extract::Request, next: Next) -> Response {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok());
+    if host_is_allowed(host) {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::FORBIDDEN,
+            "forbidden: unexpected Host header (reach the dashboard by IP address or localhost)\n",
+        )
+            .into_response()
+    }
+}
+
+/// Whether a `Host` header value is an IP literal or `localhost` (optionally with a
+/// port) — the only forms a legitimate operator uses, and the ones a DNS-rebinding
+/// attack cannot forge (it is stuck with its own hostname).
+fn host_is_allowed(host: Option<&str>) -> bool {
+    let Some(host) = host else {
+        return false;
+    };
+    let hostname = strip_port(host);
+    hostname.eq_ignore_ascii_case("localhost") || hostname.parse::<IpAddr>().is_ok()
+}
+
+/// Strip a trailing `:port` from a `Host` value, leaving the hostname/IP. Handles a
+/// bracketed IPv6 literal (`[::1]:8080` -> `::1`) and only strips an unbracketed
+/// port when a single `:` is present, so a bare IPv6 literal (`::1`, many colons)
+/// is left intact.
+fn strip_port(host: &str) -> &str {
+    if let Some(rest) = host.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match host.rsplit_once(':') {
+        Some((h, _port)) if !h.contains(':') => h,
+        _ => host,
     }
 }
 
@@ -684,6 +735,8 @@ table.log tbody tr:hover { background: var(--accent-soft); }
 .outcome-servfail { background: var(--bad-bg); color: var(--bad); }
 /* Blocked is a policy disposition, not a reachability grade: its own accent. */
 .outcome-blocked { background: var(--accent-soft); color: var(--accent); }
+/* Refused: a client outside the allowlist, never resolved. */
+.outcome-refused { background: var(--bad-bg); color: var(--bad); }
 .source-ok { background: var(--ok-bg); color: var(--ok); }
 .source-failed { background: var(--bad-bg); color: var(--bad); }
 .loghead { display: flex; align-items: center; gap: 10px; }
@@ -717,5 +770,25 @@ mod tests {
             let n: usize = "9".repeat(len).parse().unwrap();
             let _ = fmt_count(n);
         }
+    }
+
+    #[test]
+    fn rebinding_guard_accepts_ip_and_localhost_only() {
+        // Accepted: IP literals (with or without port) and localhost.
+        assert!(host_is_allowed(Some("[::1]:8080")));
+        assert!(host_is_allowed(Some("[2001:db8::1]:8080")));
+        assert!(host_is_allowed(Some("::1")));
+        assert!(host_is_allowed(Some("fe80::1")));
+        assert!(host_is_allowed(Some("127.0.0.1")));
+        assert!(host_is_allowed(Some("127.0.0.1:8080")));
+        assert!(host_is_allowed(Some("localhost")));
+        assert!(host_is_allowed(Some("localhost:8080")));
+        assert!(host_is_allowed(Some("LOCALHOST")));
+
+        // Rejected: any domain name (the rebinding attacker's form) and no Host.
+        assert!(!host_is_allowed(Some("attacker.example")));
+        assert!(!host_is_allowed(Some("dnsix.local:8080")));
+        assert!(!host_is_allowed(Some("")));
+        assert!(!host_is_allowed(None));
     }
 }

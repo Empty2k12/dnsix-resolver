@@ -3,8 +3,14 @@
 # Only `upstreams` is required; every other key shows its default.
 
 # IPv6-only listen address. Must be an IPv6 address (the listener is IPv6-only
-# by design). Default: all interfaces on port 53.
-listen = "[::]:53"
+# by design). Bound here to this host's fixed address on the client network.
+#
+# SECURITY: on "[::]:53" with a globally-routable IPv6 address and no filtering,
+# this would be an OPEN RESOLVER — usable as a DNS amplification reflector. This
+# deployment avoids that by binding a specific internal (ULA) address and, below,
+# restricting `client_networks` to the local prefix; a host firewall on UDP+TCP
+# port 53 is still recommended as defence in depth.
+listen = "[fd00:420:dead:beef::6464]:53"
 
 # NAT64 prefix to embed IPv4 addresses into. Only /96 is supported.
 # Default: the RFC 6052 well-known prefix.
@@ -21,17 +27,19 @@ cache_size = 4096
 
 # Prometheus metrics endpoint (GET /metrics) for Zabbix or any Prometheus scraper.
 # Omit to disable the endpoint. On an IPv6-only host use an IPv6 address. The
-# endpoint is unauthenticated, so bind loopback ("[::1]:9153") or keep it behind a
+# endpoint is unauthenticated, so bind loopback (as here) or keep it behind a
 # trusted network.
-metrics_listen = "[::]:9153"
+metrics_listen = "[::1]:9153"
 
 # Read-only observability dashboard (web UI): a live query log, synthesis-outcome
 # breakdown, cache stats, and recent top-lists. Omit to disable it entirely — while
 # disabled NO per-query data (client IPs, queried names) is captured or stored.
-# The UI is unauthenticated and exposes sensitive data, so bind loopback
-# ("[::1]:8080") or front it with an authenticating reverse proxy. On an IPv6-only
+# The UI is unauthenticated and exposes sensitive data (client IPs, queried
+# names), so bind loopback (as here) or front it with an authenticating reverse
+# proxy. It rejects requests whose Host header is not an IP literal or localhost
+# (anti-DNS-rebinding), so reach it by address, not a hostname. On an IPv6-only
 # host use an IPv6 address.
-ui_listen = "[::]:8080"
+ui_listen = "[::1]:8080"
 
 # How many recent queries the dashboard's in-memory query log keeps (ring buffer;
 # oldest displaced). Only has effect when ui_listen is set. Lost on restart.
@@ -51,6 +59,16 @@ blocklists = [
   "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
   "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt",
 ]
+
+# Client allowlist: IPv6 networks (CIDR) permitted to query this resolver. Empty
+# or omitted (the default) allows EVERY client — an open resolver on the bound
+# interface. Set it to your own client prefixes to make the DNS trust boundary
+# explicit; a client outside every listed network is answered REFUSED before any
+# cache or upstream lookup. The listener is IPv6-only, so entries must be IPv6 (a
+# bare address is a /128 host route). This complements, and does not replace, a
+# host firewall on port 53. Restricted here to this deployment's client prefix
+# (plus loopback for local tools); a client outside these is answered REFUSED.
+client_networks = ["fd00:420:dead:beef::/64", "::1/128"]
 
 # Upstream resolvers, tried in order with failover. The listener is IPv6-only,
 # but upstreams may be IPv4 or IPv6 — use whatever the host can reach. On an

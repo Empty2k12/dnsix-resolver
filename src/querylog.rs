@@ -47,6 +47,8 @@ pub enum Outcome {
     Passthrough,
     /// The name was on the **Blocklist**: answered NXDOMAIN locally, no upstream.
     Blocked,
+    /// The client was outside the configured allowlist: answered REFUSED locally.
+    Refused,
     /// Every upstream failed; the client got SERVFAIL.
     ServFail,
 }
@@ -66,6 +68,7 @@ impl Outcome {
             Outcome::EmptyNodata => "empty",
             Outcome::Passthrough => "passthrough",
             Outcome::Blocked => "blocked",
+            Outcome::Refused => "refused",
             Outcome::ServFail => "servfail",
         }
     }
@@ -79,6 +82,7 @@ impl Outcome {
             Outcome::EmptyNodata => "empty".to_string(),
             Outcome::Passthrough => "passthrough".to_string(),
             Outcome::Blocked => "blocked".to_string(),
+            Outcome::Refused => "refused".to_string(),
             Outcome::ServFail => "servfail".to_string(),
         }
     }

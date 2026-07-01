@@ -4,6 +4,7 @@
 //! synthesizing AAAA records (RFC 6147) for IPv4-only names so IPv6-only clients
 //! reach IPv4-only hosts via a companion NAT64 translator.
 
+mod acl;
 mod blocklist;
 mod config;
 mod handler;
@@ -136,7 +137,21 @@ async fn main() -> anyhow::Result<()> {
         _ => info!("dashboard disabled (set `ui_listen` to enable)"),
     }
 
-    let handler = Dns64Handler::new(pool, chain, metrics, query_log, blocklist);
+    // Client allowlist (if configured). Empty = allow all, so we pass `None` to
+    // keep the historical open-resolver behaviour and skip a hot-path check.
+    let client_acl = crate::acl::ClientAcl::parse(&cfg.client_networks)?;
+    let client_acl = (!client_acl.is_empty()).then(|| Arc::new(client_acl));
+    match &client_acl {
+        Some(_) => info!(
+            networks = cfg.client_networks.len(),
+            "client allowlist active; clients outside it are refused"
+        ),
+        None => {
+            info!("client allowlist disabled (set `client_networks` to restrict who may query)")
+        }
+    }
+
+    let handler = Dns64Handler::new(pool, chain, metrics, query_log, blocklist, client_acl);
 
     let mut server = hickory_server::ServerFuture::new(handler);
     server
